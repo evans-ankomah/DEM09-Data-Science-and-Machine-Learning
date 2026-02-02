@@ -1,0 +1,21 @@
+# Airflow runtime
+logs/
+airflow.db
+airflow.cfg
+__pycache__/
+*.pyc
+
+# dbt build artifacts
+dbt_project/target/
+dbt_project/logs/
+dbt_project/dbt_packages/
+
+# VS Code
+.vscode/
+
+# Output artifacts (optional)
+output/
+
+# OS
+.DS_Store
+Thumbs.db

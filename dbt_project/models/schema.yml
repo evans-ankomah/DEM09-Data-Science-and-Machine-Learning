@@ -1,0 +1,203 @@
+# ============================================
+# dbt Sources and Model Schema
+# Flight Price Analysis - Medallion Architecture
+# ============================================
+
+version: 2
+
+# ============================================
+# Sources: Bronze Layer (PostgreSQL)
+# ============================================
+sources:
+  - name: bronze
+    description: "Bronze layer - Raw flight price data from CSV"
+    database: analytics
+    schema: bronze
+    tables:
+      - name: raw_flight_prices
+        description: "Raw flight price data loaded from Bangladesh dataset"
+        columns:
+          - name: id
+            description: "Auto-generated primary key"
+          - name: airline
+            description: "Name of the airline operating the flight"
+          - name: source
+            description: "Source airport code"
+          - name: source_name
+            description: "Full name of the source city/airport"
+          - name: destination
+            description: "Destination airport code"
+          - name: destination_name
+            description: "Full name of the destination city/airport"
+          - name: departure_datetime
+            description: "Scheduled departure date and time"
+          - name: arrival_datetime
+            description: "Scheduled arrival date and time"
+          - name: duration_hrs
+            description: "Flight duration in hours"
+          - name: stopovers
+            description: "Number of stops (Direct, 1 Stop, 2 Stops)"
+          - name: aircraft_type
+            description: "Type of aircraft used"
+          - name: class
+            description: "Travel class (Economy, Business, First)"
+          - name: booking_source
+            description: "Platform or source where booking was made"
+          - name: base_fare_bdt
+            description: "Base fare in Bangladeshi Taka"
+          - name: tax_surcharge_bdt
+            description: "Tax and surcharge in Bangladeshi Taka"
+          - name: total_fare_bdt
+            description: "Total fare (base + tax) in Bangladeshi Taka"
+          - name: seasonality
+            description: "Season label from original dataset (Regular, Eid, Hajj, Winter)"
+          - name: days_before_departure
+            description: "Number of days between booking and departure"
+
+# ============================================
+# Models: Silver Layer
+# ============================================
+models:
+  - name: stg_flight_prices
+    description: |
+      Cleaned and standardized flight price data with Ghana-like seasonality mapping.
+      
+      **Transformations:**
+      - Trimmed and standardized text fields
+      - Parsed datetime fields
+      - Ensured non-negative fare values
+      - Added seasonality_gh (Ghana-like seasonal mapping)
+    columns:
+      - name: id
+        description: "Primary key from source"
+        tests:
+          - unique
+          - not_null
+      - name: airline
+        description: "Airline name (cleaned)"
+        tests:
+          - not_null
+      - name: source
+        description: "Source airport code"
+        tests:
+          - not_null
+      - name: destination
+        description: "Destination airport code"
+        tests:
+          - not_null
+      - name: departure_datetime
+        description: "Parsed departure timestamp"
+        tests:
+          - not_null
+      - name: base_fare_bdt
+        description: "Base fare (non-negative)"
+        tests:
+          - not_null
+      - name: tax_surcharge_bdt
+        description: "Tax and surcharge (non-negative)"
+        tests:
+          - not_null
+      - name: stopovers
+        description: "Stopover category"
+        tests:
+          - accepted_values:
+              values: ['Direct', '1 Stop', '2 Stops']
+      - name: class
+        description: "Travel class"
+        tests:
+          - accepted_values:
+              values: ['Economy', 'Business', 'First Class']
+      - name: seasonality
+        description: "Original dataset seasonality"
+        tests:
+          - accepted_values:
+              values: ['Regular', 'Eid', 'Hajj', 'Winter Holidays']
+      - name: seasonality_gh
+        description: |
+          Ghana-like seasonality derived from departure date.
+          Mapping uses priority rules for overlapping periods.
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - 'Regular'
+                - 'Christmas_NewYear'
+                - 'Easter'
+                - 'Independence_Day'
+                - 'Farmers_Day'
+                - 'BackToSchool'
+                - 'Homowo_Festival'
+                - 'ChaleWote_Week'
+                - 'Eid_like'
+                - 'Hajj_like'
+
+# ============================================
+# Models: Gold Layer
+# ============================================
+  - name: avg_fare_by_airline
+    description: "Average fare metrics aggregated by airline"
+    columns:
+      - name: airline
+        description: "Airline name"
+        tests:
+          - unique
+          - not_null
+      - name: booking_count
+        description: "Total bookings for this airline"
+      - name: avg_total_fare_bdt
+        description: "Average total fare in BDT"
+
+  - name: booking_count_by_airline
+    description: "Booking count and market share by airline"
+    columns:
+      - name: airline
+        description: "Airline name"
+        tests:
+          - unique
+          - not_null
+      - name: total_bookings
+        description: "Total number of bookings"
+      - name: market_share_pct
+        description: "Percentage of total market"
+
+  - name: top_routes
+    description: "Top 50 routes by booking count"
+    columns:
+      - name: source
+        description: "Source airport code"
+        tests:
+          - not_null
+      - name: destination
+        description: "Destination airport code"
+        tests:
+          - not_null
+      - name: booking_count
+        description: "Number of bookings on this route"
+
+  - name: seasonal_fare_variation
+    description: "Fare analysis by original dataset seasonality"
+    columns:
+      - name: seasonality
+        description: "Season from original dataset"
+        tests:
+          - unique
+          - not_null
+      - name: avg_total_fare_bdt
+        description: "Average total fare for this season"
+      - name: fare_pct_diff_from_avg
+        description: "Percentage difference from overall average"
+
+  - name: seasonal_fare_variation_gh
+    description: "Fare analysis using Ghana-like seasonality mapping"
+    columns:
+      - name: seasonality_gh
+        description: "Ghana-like season derived from departure date"
+        tests:
+          - unique
+          - not_null
+      - name: avg_total_fare_bdt
+        description: "Average total fare for this Ghana-like season"
+      - name: fare_pct_diff_from_avg
+        description: "Percentage difference from overall average"
+      - name: season_type
+        description: "Category: Peak, Festival, School, or Non-Peak"

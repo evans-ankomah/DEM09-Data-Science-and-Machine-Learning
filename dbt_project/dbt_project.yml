@@ -1,0 +1,39 @@
+# ============================================
+# dbt Project Configuration
+# Flight Price Analysis - Medallion Architecture
+# ============================================
+
+name: 'flight_price_dbt'
+version: '1.0.0'
+config-version: 2
+
+# Default profile (defined in profiles.yml)
+profile: 'flight_price'
+
+# Directory configurations
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+# Clean targets
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Model configurations
+models:
+  flight_price_dbt:
+    # Silver layer: Cleaned and standardized data
+    silver:
+      +materialized: table
+      +schema: silver
+      +tags: ['silver', 'staging']
+    
+    # Gold layer: KPI and analytics tables
+    gold:
+      +materialized: table
+      +schema: gold
+      +tags: ['gold', 'kpi', 'analytics']

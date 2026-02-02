@@ -1,0 +1,172 @@
+# ============================================
+# Docker Compose for Flight Price Analysis
+# Airflow + MySQL + PostgreSQL + dbt
+# ============================================
+
+version: '3.8'
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.7.0-python3.10
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: 'zTvhk5DH5wF-BKRbDCYs5x8gMJxM6b1JzWU6R2fjKeo='
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    AIRFLOW__WEBSERVER__RBAC: 'true'
+    # MySQL connection for Bronze layer
+    MYSQL_HOST: mysql
+    MYSQL_PORT: 3306
+    MYSQL_USER: root
+    MYSQL_PASSWORD: root
+    MYSQL_DATABASE: flight_bronze
+    # PostgreSQL connection for Silver/Gold layers
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: 5432
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: postgres
+    POSTGRES_DATABASE: analytics
+    # dbt environment variables
+    DBT_PROFILES_DIR: /opt/airflow/dbt_project
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./dbt_project:/opt/airflow/dbt_project
+    - ./include/data:/opt/airflow/data
+    - ./logs:/opt/airflow/logs
+  depends_on:
+    mysql:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+    postgres-airflow:
+      condition: service_healthy
+
+services:
+  # ============================================
+  # MySQL - Bronze Layer (Raw Staging)
+  # ============================================
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: flight_bronze
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - airflow-network
+
+  # ============================================
+  # PostgreSQL - Silver/Gold Layers (Analytics)
+  # ============================================
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: analytics
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - airflow-network
+
+  # ============================================
+  # PostgreSQL for Airflow Metadata
+  # ============================================
+  postgres-airflow:
+    image: postgres:13
+    container_name: postgres-airflow
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_airflow_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - airflow-network
+
+  # ============================================
+  # Airflow Webserver
+  # ============================================
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - airflow-network
+
+  # ============================================
+  # Airflow Scheduler
+  # ============================================
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f /opt/airflow/airflow-scheduler.pid ]"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - airflow-network
+
+  # ============================================
+  # Airflow Init (Database setup + Admin user)
+  # ============================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db init
+        airflow users create \
+          --username airflow \
+          --password airflow \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+        # Install dbt dependencies
+        pip install dbt-postgres==1.7.0
+        cd /opt/airflow/dbt_project && dbt deps || true
+    networks:
+      - airflow-network
+
+volumes:
+  mysql_data:
+  postgres_data:
+  postgres_airflow_data:
+
+networks:
+  airflow-network:
+    driver: bridge

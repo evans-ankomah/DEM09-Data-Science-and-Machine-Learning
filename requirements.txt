@@ -1,0 +1,17 @@
+# ============================================
+# Python Dependencies for Flight Price Pipeline
+# ============================================
+
+# Airflow (included in Docker image, listed for reference)
+apache-airflow==2.7.0
+
+# Database connectors
+mysql-connector-python==8.1.0
+psycopg2-binary==2.9.7
+sqlalchemy==1.4.49
+
+# Data processing
+pandas==2.0.3
+
+# dbt for transformations
+dbt-postgres==1.7.0
