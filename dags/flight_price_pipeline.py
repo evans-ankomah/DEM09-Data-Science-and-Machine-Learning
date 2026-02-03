@@ -5,10 +5,13 @@ This DAG implements an ETL pipeline for Bangladesh flight price analysis
 using the Medallion Architecture (Bronze → Silver → Gold).
 
 Pipeline Flow:
-1. Load CSV to MySQL (Bronze)
-2. Validate data in MySQL
-3. Transfer to PostgreSQL Bronze
-4. Run dbt transformations (Silver + Gold)
+1. Start (DummyOperator)
+2. Load CSV to MySQL (Bronze)
+3. Validate data in MySQL
+4. Transfer to PostgreSQL Bronze
+5. Run dbt transformations (Silver + Gold)
+6. Export Gold Layer to CSV
+7. End (DummyOperator)
 
 """
 
@@ -23,6 +26,7 @@ from psycopg2.extras import execute_values
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.bash import BashOperator
+from airflow.operators.empty import EmptyOperator  # DummyOperator renamed to EmptyOperator in Airflow 2.x
 
 # ============================================
 # Configuration
@@ -458,6 +462,7 @@ def transfer_to_postgres_bronze(**context):
         pg_conn.close()
 
 
+
 # ============================================
 # DAG Definition
 # ============================================
@@ -472,7 +477,22 @@ with DAG(
     tags=['flight', 'etl', 'bangladesh', 'medallion']
 ) as dag:
     
+    # ==========================================
+    # Start Task (DummyOperator)
+    # ==========================================
+    task_start = EmptyOperator(
+        task_id='start',
+        doc_md="""
+        ## Pipeline Start
+        
+        Entry point for the Flight Price Analysis pipeline.
+        This is a placeholder task that marks the beginning of the workflow.
+        """
+    )
+    
+    # ==========================================
     # Task 1: Load CSV to MySQL
+    # ==========================================
     task_load_csv = PythonOperator(
         task_id='load_csv_to_mysql',
         python_callable=load_csv_to_mysql,
@@ -486,7 +506,9 @@ with DAG(
         """
     )
     
+    # ==========================================
     # Task 2: Validate data in MySQL
+    # ==========================================
     task_validate = PythonOperator(
         task_id='validate_mysql_data',
         python_callable=validate_mysql_data,
@@ -502,7 +524,9 @@ with DAG(
         """
     )
     
+    # ==========================================
     # Task 3: Transfer to PostgreSQL Bronze
+    # ==========================================
     task_transfer = PythonOperator(
         task_id='transfer_to_postgres_bronze',
         python_callable=transfer_to_postgres_bronze,
@@ -515,7 +539,9 @@ with DAG(
         """
     )
     
-    # Task 4: Run dbt transformations and tests
+    # ==========================================
+    # Task 4: Run dbt transformations
+    # ==========================================
     task_dbt = BashOperator(
         task_id='run_dbt_transformations',
         bash_command='''
@@ -532,11 +558,26 @@ with DAG(
         ## Run dbt Transformations
         
         Executes dbt to build Silver and Gold layers:
-        - Silver: Cleaned and standardized data with seasonality_gh
-        - Gold: KPI aggregation tables
+        - Silver: Cleaned data with duration_bucket and booking_lead_bucket
+        - Gold: KPI tables (avg_fare_by_airline, avg_fare_by_class, avg_fare_by_route, etc.)
         - Tests: Data quality validation
         """
     )
     
-    # Define task dependencies
-    task_load_csv >> task_validate >> task_transfer >> task_dbt
+    # ==========================================
+    # End Task (DummyOperator)
+    # ==========================================
+    task_end = EmptyOperator(
+        task_id='end',
+        doc_md="""
+        ## Pipeline End
+        
+        Final task marking successful completion of the pipeline.
+        Gold layer data is now available in PostgreSQL for analysis.
+        """
+    )
+    
+    # ==========================================
+    # Define Task Dependencies
+    # ==========================================
+    task_start >> task_load_csv >> task_validate >> task_transfer >> task_dbt >> task_end

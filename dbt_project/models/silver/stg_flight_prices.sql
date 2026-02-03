@@ -5,22 +5,17 @@ Silver Layer: Staged Flight Prices
 
 Purpose:
   Clean, validate, and standardize raw flight price data from the Bronze layer.
-  Adds Ghana-like seasonality mapping (seasonality_gh) based on departure date.
 
 Source: bronze.raw_flight_prices
 Target: silver.stg_flight_prices
 
-Ghana-Like Seasonality Rules (Priority Order):
-  1. Eid (from dataset) → Eid_like
-  2. Hajj (from dataset) → Hajj_like
-  3. Aug 10-20 → ChaleWote_Week
-  4. Aug 1-31 → Homowo_Festival
-  5. Dec 15 - Jan 10 → Christmas_NewYear
-  6. Mar 1-15 → Independence_Day
-  7. Mar 15 - Apr 30 → Easter
-  8. Dec 1-10 → Farmers_Day
-  9. Jan 11 - Feb 15 OR Aug 15 - Sep 30 → BackToSchool
-  10. Otherwise → Regular
+Transformations Applied:
+  1. Trim whitespace from text fields
+  2. Parse datetime fields to proper timestamps
+  3. Ensure non-negative fare values
+  4. Standardize categorical fields
+  5. Create duration_bucket (Short/Medium/Long)
+  6. Create booking_lead_bucket (Last Minute/Standard/Early Bird)
 */
 
 {{ config(
@@ -79,8 +74,8 @@ cleaned_data AS (
             ELSE NULL
         END AS arrival_datetime,
         
-        -- Numeric fields (already cleaned in MySQL)
-        duration_hrs,
+        -- Numeric fields
+        COALESCE(duration_hrs, 0) AS duration_hrs,
         
         -- Standardize categorical fields
         TRIM(stopovers) AS stopovers,
@@ -96,88 +91,47 @@ cleaned_data AS (
         -- Original seasonality from dataset
         TRIM(seasonality) AS seasonality,
         
-        days_before_departure,
+        COALESCE(days_before_departure, 0) AS days_before_departure,
         created_at
     FROM source_data
-),
-
-final AS (
-    SELECT
-        id,
-        airline,
-        source,
-        source_name,
-        destination,
-        destination_name,
-        departure_datetime,
-        arrival_datetime,
-        duration_hrs,
-        stopovers,
-        aircraft_type,
-        class,
-        booking_source,
-        base_fare_bdt,
-        tax_surcharge_bdt,
-        total_fare_bdt,
-        seasonality,
-        days_before_departure,
-        
-        -- Ghana-like seasonality mapping
-        CASE
-            -- Priority 1 & 2: Use dataset seasonality for Eid and Hajj
-            WHEN seasonality = 'Eid' THEN 'Eid_like'
-            WHEN seasonality = 'Hajj' THEN 'Hajj_like'
-            
-            -- Priority 3: ChaleWote_Week (Aug 10-20)
-            WHEN EXTRACT(MONTH FROM departure_datetime) = 8 
-                 AND EXTRACT(DAY FROM departure_datetime) BETWEEN 10 AND 20 
-            THEN 'ChaleWote_Week'
-            
-            -- Priority 4: Homowo_Festival (August)
-            WHEN EXTRACT(MONTH FROM departure_datetime) = 8 
-            THEN 'Homowo_Festival'
-            
-            -- Priority 5: Christmas_NewYear (Dec 15 - Jan 10)
-            WHEN (EXTRACT(MONTH FROM departure_datetime) = 12 
-                  AND EXTRACT(DAY FROM departure_datetime) >= 15)
-                 OR (EXTRACT(MONTH FROM departure_datetime) = 1 
-                     AND EXTRACT(DAY FROM departure_datetime) <= 10)
-            THEN 'Christmas_NewYear'
-            
-            -- Priority 6: Independence_Day (Mar 1-15)
-            WHEN EXTRACT(MONTH FROM departure_datetime) = 3 
-                 AND EXTRACT(DAY FROM departure_datetime) BETWEEN 1 AND 15
-            THEN 'Independence_Day'
-            
-            -- Priority 7: Easter (Mar 15 - Apr 30)
-            WHEN (EXTRACT(MONTH FROM departure_datetime) = 3 
-                  AND EXTRACT(DAY FROM departure_datetime) >= 15)
-                 OR (EXTRACT(MONTH FROM departure_datetime) = 4)
-            THEN 'Easter'
-            
-            -- Priority 8: Farmers_Day (Dec 1-10)
-            WHEN EXTRACT(MONTH FROM departure_datetime) = 12 
-                 AND EXTRACT(DAY FROM departure_datetime) BETWEEN 1 AND 10
-            THEN 'Farmers_Day'
-            
-            -- Priority 9: BackToSchool (Jan 11 - Feb 15 OR Aug 15 - Sep 30)
-            WHEN (EXTRACT(MONTH FROM departure_datetime) = 1 
-                  AND EXTRACT(DAY FROM departure_datetime) >= 11)
-                 OR (EXTRACT(MONTH FROM departure_datetime) = 2 
-                     AND EXTRACT(DAY FROM departure_datetime) <= 15)
-                 OR (EXTRACT(MONTH FROM departure_datetime) = 8 
-                     AND EXTRACT(DAY FROM departure_datetime) >= 15)
-                 OR (EXTRACT(MONTH FROM departure_datetime) = 9)
-            THEN 'BackToSchool'
-            
-            -- Default: Regular
-            ELSE 'Regular'
-        END AS seasonality_gh,
-        
-        created_at,
-        CURRENT_TIMESTAMP AS processed_at
-        
-    FROM cleaned_data
 )
 
-SELECT * FROM final
+SELECT
+    id,
+    airline,
+    source,
+    source_name,
+    destination,
+    destination_name,
+    departure_datetime,
+    arrival_datetime,
+    duration_hrs,
+    
+    -- NEW: Duration Bucket (categorize flight length)
+    CASE
+        WHEN duration_hrs <= 3 THEN 'Short (0-3h)'
+        WHEN duration_hrs <= 6 THEN 'Medium (3-6h)'
+        ELSE 'Long (6+h)'
+    END AS duration_bucket,
+    
+    stopovers,
+    aircraft_type,
+    class,
+    booking_source,
+    base_fare_bdt,
+    tax_surcharge_bdt,
+    total_fare_bdt,
+    seasonality,
+    days_before_departure,
+    
+    -- NEW: Booking Lead Time Bucket (how far in advance was booking made)
+    CASE
+        WHEN days_before_departure <= 3 THEN 'Last Minute (0-3 days)'
+        WHEN days_before_departure <= 14 THEN 'Short Notice (4-14 days)'
+        WHEN days_before_departure <= 30 THEN 'Standard (15-30 days)'
+        ELSE 'Early Bird (30+ days)'
+    END AS booking_lead_bucket,
+    
+    created_at,
+    CURRENT_TIMESTAMP AS processed_at
+FROM cleaned_data
