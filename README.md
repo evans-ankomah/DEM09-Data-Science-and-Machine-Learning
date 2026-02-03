@@ -80,6 +80,19 @@ All containers should show "Up" status.
 
 ---
 
+## Pipeline Tasks
+
+| Task | Description |
+|------|-------------|
+| `start` | Pipeline entry point |
+| `load_csv_to_mysql` | Load CSV into MySQL Bronze layer |
+| `validate_mysql_data` | Validate data quality |
+| `transfer_to_postgres_bronze` | Transfer to PostgreSQL |
+| `run_dbt_transformations` | Build Silver + Gold layers |
+| `end` | Pipeline completion |
+
+---
+
 ## ✅ TEST GUIDE
 
 ### Verify Bronze Layer (MySQL)
@@ -108,23 +121,28 @@ docker exec -it postgres bash -c "psql -U postgres -d analytics -c 'SELECT COUNT
 
 **Expected**: Same count as Bronze
 
-Check Ghana-like seasonality values:
+Check duration buckets:
 
 ```bash
-docker exec -it postgres bash -c "psql -U postgres -d analytics -c 'SELECT DISTINCT seasonality_gh FROM silver.stg_flight_prices ORDER BY 1;'"
+docker exec -it postgres bash -c "psql -U postgres -d analytics -c 'SELECT DISTINCT duration_bucket FROM silver.stg_flight_prices ORDER BY 1;'"
 ```
 
 **Expected values**:
-- BackToSchool
-- ChaleWote_Week
-- Christmas_NewYear
-- Easter
-- Eid_like
-- Farmers_Day
-- Hajj_like
-- Homowo_Festival
-- Independence_Day
-- Regular
+- Long (6+h)
+- Medium (3-6h)
+- Short (0-3h)
+
+Check booking lead buckets:
+
+```bash
+docker exec -it postgres bash -c "psql -U postgres -d analytics -c 'SELECT DISTINCT booking_lead_bucket FROM silver.stg_flight_prices ORDER BY 1;'"
+```
+
+**Expected values**:
+- Early Bird (30+ days)
+- Last Minute (0-3 days)
+- Short Notice (4-14 days)
+- Standard (15-30 days)
 
 ### Verify Gold Layer
 
@@ -133,11 +151,12 @@ Check all KPI tables have data:
 ```bash
 docker exec -it postgres bash -c "psql -U postgres -d analytics -c '
 SELECT 
-  (SELECT COUNT(*) FROM gold.avg_fare_by_airline) AS avg_fare_rows,
-  (SELECT COUNT(*) FROM gold.booking_count_by_airline) AS booking_count_rows,
-  (SELECT COUNT(*) FROM gold.top_routes) AS top_routes_rows,
-  (SELECT COUNT(*) FROM gold.seasonal_fare_variation) AS seasonal_rows,
-  (SELECT COUNT(*) FROM gold.seasonal_fare_variation_gh) AS seasonal_gh_rows;
+  (SELECT COUNT(*) FROM gold.avg_fare_by_airline) AS avg_fare_airline,
+  (SELECT COUNT(*) FROM gold.avg_fare_by_class) AS avg_fare_class,
+  (SELECT COUNT(*) FROM gold.avg_fare_by_route) AS avg_fare_route,
+  (SELECT COUNT(*) FROM gold.booking_count_by_airline) AS booking_count,
+  (SELECT COUNT(*) FROM gold.top_routes) AS top_routes,
+  (SELECT COUNT(*) FROM gold.seasonal_fare_variation) AS seasonal;
 '"
 ```
 
@@ -173,6 +192,15 @@ Done. PASS=XX
 2. Ensure port 8080 is not in use: `netstat -an | find "8080"`
 3. Restart webserver: `docker-compose restart airflow-webserver`
 
+### dbt Command Not Found
+
+**Symptom**: `dbt: command not found`
+
+**Solution**:
+```bash
+docker exec -it airflow-scheduler bash -c "pip install dbt-postgres"
+```
+
 ### dbt Profile Errors
 
 **Symptom**: `Could not find profile named 'flight_price'`
@@ -181,15 +209,6 @@ Done. PASS=XX
 1. Ensure profiles.yml exists in dbt_project folder
 2. Check DBT_PROFILES_DIR environment variable is set
 3. Verify file permissions
-
-### Missing dbt_utils Package
-
-**Symptom**: `Compilation Error: Package 'dbt_utils' not found`
-
-**Solution**:
-```bash
-docker exec -it airflow-scheduler bash -c "cd /opt/airflow/dbt_project && dbt deps"
-```
 
 ### Port Conflicts
 
@@ -220,24 +239,26 @@ docker exec -it airflow-scheduler bash -c "cat /opt/airflow/dbt_project/logs/dbt
 
 ---
 
-## Ghana-like Seasonality Mapping
+## Silver Layer Transformations
 
-This project maps the original Bangladesh seasonality to Ghana-like seasonal patterns based on departure dates.
+| Transformation | Description |
+|----------------|-------------|
+| `duration_bucket` | Categorizes flights: Short (0-3h), Medium (3-6h), Long (6+h) |
+| `booking_lead_bucket` | Categorizes booking lead time: Last Minute, Short Notice, Standard, Early Bird |
+| Data cleaning | Trims whitespace, parses dates, ensures non-negative fares |
 
-| seasonality_gh | Date Range | Priority |
-|----------------|------------|----------|
-| Eid_like | From dataset Seasonality = Eid | 1 |
-| Hajj_like | From dataset Seasonality = Hajj | 2 |
-| ChaleWote_Week | Aug 10 – Aug 20 | 3 |
-| Homowo_Festival | Aug 1 – Aug 31 | 4 |
-| Christmas_NewYear | Dec 15 – Jan 10 | 5 |
-| Independence_Day | Mar 1 – Mar 15 | 6 |
-| Easter | Mar 15 – Apr 30 | 7 |
-| Farmers_Day | Dec 1 – Dec 10 | 8 |
-| BackToSchool | Jan 11 – Feb 15; Aug 15 – Sep 30 | 9 |
-| Regular | Default | 10 |
+---
 
-> **Note**: This is an assumption-based seasonal mapping for educational purposes. Overlapping dates follow priority order (lower number = higher priority).
+## Gold Layer KPIs
+
+| Model | Description |
+|-------|-------------|
+| `avg_fare_by_airline` | Average fare per airline |
+| `avg_fare_by_class` | Average fare by travel class (Economy/Business/First) |
+| `avg_fare_by_route` | Average fare per route with price-per-hour metric |
+| `booking_count_by_airline` | Total bookings and market share by airline |
+| `top_routes` | Most popular routes by booking count |
+| `seasonal_fare_variation` | Fare patterns by seasonality |
 
 ---
 
@@ -256,10 +277,11 @@ flight-price-airflow-dbt/
 │       │   └── stg_flight_prices.sql
 │       ├── gold/
 │       │   ├── avg_fare_by_airline.sql
+│       │   ├── avg_fare_by_class.sql
+│       │   ├── avg_fare_by_route.sql
 │       │   ├── booking_count_by_airline.sql
 │       │   ├── top_routes.sql
-│       │   ├── seasonal_fare_variation.sql
-│       │   └── seasonal_fare_variation_gh.sql
+│       │   └── seasonal_fare_variation.sql
 │       └── schema.yml              # Tests & docs
 ├── include/data/
 │   └── Flight_Price_Dataset_of_Bangladesh.csv

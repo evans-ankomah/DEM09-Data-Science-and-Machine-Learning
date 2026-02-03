@@ -157,14 +157,16 @@ docker exec -u airflow airflow-scheduler bash -c "cd /opt/airflow/dbt_project &&
 docker exec airflow-scheduler airflow dags trigger flight_price_pipeline
 ```
 
-### What Happens During Execution
+### Pipeline Tasks
 
 | Task | Description | Duration |
 |------|-------------|----------|
-| 1. load_csv_to_mysql | Loads 57,000 rows to MySQL Bronze | ~30 sec |
-| 2. validate_mysql_data | Validates columns, nulls, data types | ~5 sec |
-| 3. transfer_to_postgres_bronze | Transfers data to PostgreSQL | ~15 sec |
-| 4. run_dbt_transformations | Builds Silver + Gold tables | ~30 sec |
+| 1. start | Pipeline entry point (DummyOperator) | ~1 sec |
+| 2. load_csv_to_mysql | Loads 57,000 rows to MySQL Bronze | ~30 sec |
+| 3. validate_mysql_data | Validates columns, nulls, data types | ~5 sec |
+| 4. transfer_to_postgres_bronze | Transfers data to PostgreSQL | ~15 sec |
+| 5. run_dbt_transformations | Builds Silver + Gold tables | ~30 sec |
+| 6. end | Pipeline completion (DummyOperator) | ~1 sec |
 
 **Total expected runtime: 1-2 minutes**
 
@@ -183,44 +185,71 @@ docker exec mysql mysql -u root -proot flight_bronze -e "SELECT COUNT(*) as rows
 ### Step 5.2: Check Silver Layer (PostgreSQL)
 
 ```powershell
-docker exec postgres psql -U postgres -d analytics -c "SELECT COUNT(*) FROM public_silver.stg_flight_prices;"
+docker exec postgres psql -U postgres -d analytics -c "SELECT COUNT(*) FROM silver.stg_flight_prices;"
 ```
 
 **Expected: 57,000 rows**
 
-### Step 5.3: Check Gold Layer Tables
+### Step 5.3: Check New Transformations
+
+**Duration Buckets:**
+```powershell
+docker exec postgres psql -U postgres -d analytics -c "SELECT DISTINCT duration_bucket FROM silver.stg_flight_prices ORDER BY 1;"
+```
+
+**Expected values:**
+- Long (6+h)
+- Medium (3-6h)
+- Short (0-3h)
+
+**Booking Lead Buckets:**
+```powershell
+docker exec postgres psql -U postgres -d analytics -c "SELECT DISTINCT booking_lead_bucket FROM silver.stg_flight_prices ORDER BY 1;"
+```
+
+**Expected values:**
+- Early Bird (30+ days)
+- Last Minute (0-3 days)
+- Short Notice (4-14 days)
+- Standard (15-30 days)
+
+### Step 5.4: Check Gold Layer Tables
 
 ```powershell
 docker exec postgres psql -U postgres -d analytics -c "
-SELECT 'avg_fare_by_airline' as table_name, COUNT(*) as rows FROM public_gold.avg_fare_by_airline
+SELECT 'avg_fare_by_airline' as table_name, COUNT(*) as rows FROM gold.avg_fare_by_airline
 UNION ALL
-SELECT 'booking_count_by_airline', COUNT(*) FROM public_gold.booking_count_by_airline
+SELECT 'avg_fare_by_class', COUNT(*) FROM gold.avg_fare_by_class
 UNION ALL
-SELECT 'top_routes', COUNT(*) FROM public_gold.top_routes
+SELECT 'avg_fare_by_route', COUNT(*) FROM gold.avg_fare_by_route
 UNION ALL
-SELECT 'seasonal_fare_variation', COUNT(*) FROM public_gold.seasonal_fare_variation
+SELECT 'booking_count_by_airline', COUNT(*) FROM gold.booking_count_by_airline
 UNION ALL
-SELECT 'seasonal_fare_variation_gh', COUNT(*) FROM public_gold.seasonal_fare_variation_gh;
+SELECT 'top_routes', COUNT(*) FROM gold.top_routes
+UNION ALL
+SELECT 'seasonal_fare_variation', COUNT(*) FROM gold.seasonal_fare_variation;
 "
 ```
 
-### Step 5.4: View Ghana-like Seasonality Results
+### Step 5.5: View Sample Results
 
+**Average Fare by Class:**
 ```powershell
-docker exec postgres psql -U postgres -d analytics -c "
-SELECT seasonality_gh, booking_count, avg_total_fare_bdt, season_type 
-FROM public_gold.seasonal_fare_variation_gh 
-ORDER BY avg_total_fare_bdt DESC;
-"
+docker exec postgres psql -U postgres -d analytics -c "SELECT * FROM gold.avg_fare_by_class;"
 ```
 
-### Step 5.5: Run dbt Tests (Optional)
+**Top Routes:**
+```powershell
+docker exec postgres psql -U postgres -d analytics -c "SELECT route, booking_count, avg_fare_bdt FROM gold.avg_fare_by_route LIMIT 10;"
+```
+
+### Step 5.6: Run dbt Tests (Optional)
 
 ```powershell
 docker exec -u airflow airflow-scheduler bash -c "cd /opt/airflow/dbt_project && /home/airflow/.local/bin/dbt test --profiles-dir ."
 ```
 
-**Expected: PASS=23 WARN=0 ERROR=0**
+**Expected: PASS=XX WARN=0 ERROR=0**
 
 ---
 
@@ -235,27 +264,30 @@ MySQL Bronze (raw_flight_prices)
     ↓
 PostgreSQL Bronze (bronze.raw_flight_prices)
     ↓
-PostgreSQL Silver (public_silver.stg_flight_prices)
+PostgreSQL Silver (silver.stg_flight_prices)
     - Cleaned data
-    - Ghana-like seasonality added
+    - duration_bucket (Short/Medium/Long)
+    - booking_lead_bucket (Last Minute/Standard/Early Bird)
     ↓
 PostgreSQL Gold (KPI tables)
     - avg_fare_by_airline
+    - avg_fare_by_class
+    - avg_fare_by_route
     - booking_count_by_airline
     - top_routes
     - seasonal_fare_variation
-    - seasonal_fare_variation_gh
 ```
 
-### Ghana-like Seasonality Mapping
+### Gold Layer Tables
 
-| Season | Description | Fare Impact |
-|--------|-------------|-------------|
-| Hajj_like | Pilgrimage season | Highest fares |
-| Eid_like | Festival season | Very high fares |
-| Christmas_NewYear | Holiday period | High fares |
-| Easter | Spring holiday | Moderate-high |
-| Regular | Normal periods | Baseline fares |
+| Table | Description |
+|-------|-------------|
+| avg_fare_by_airline | Average fare per airline |
+| avg_fare_by_class | Average fare by travel class (Economy/Business/First) |
+| avg_fare_by_route | Average fare per route with price-per-hour metric |
+| booking_count_by_airline | Total bookings and market share by airline |
+| top_routes | Most popular routes by booking count |
+| seasonal_fare_variation | Fare patterns by seasonality |
 
 ---
 
@@ -330,7 +362,7 @@ docker-compose logs airflow-scheduler | tail -50
 Check if actual data values match schema.yml accepted_values:
 
 ```powershell
-docker exec postgres psql -U postgres -d analytics -c "SELECT DISTINCT seasonality FROM public_silver.stg_flight_prices;"
+docker exec postgres psql -U postgres -d analytics -c "SELECT DISTINCT seasonality FROM silver.stg_flight_prices;"
 ```
 
 ---
