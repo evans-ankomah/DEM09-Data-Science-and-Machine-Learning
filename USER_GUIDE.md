@@ -1,4 +1,4 @@
-# 📘 Flight Price Analysis Pipeline - User Guide
+# Flight Price Analysis Pipeline - User Guide
 
 ## Complete Step-by-Step Instructions
 
@@ -143,7 +143,7 @@ docker exec airflow-scheduler dbt --version
 
 4. **Enable the DAG**: Click the toggle switch to "On" (if grey/paused)
 
-5. **Trigger the DAG**: Click the ▶️ Play button
+5. **Trigger the DAG**: Click the Play button
 
 6. **Monitor**: Watch the Graph view for task progress
 

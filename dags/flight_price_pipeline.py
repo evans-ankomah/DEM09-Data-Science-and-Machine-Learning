@@ -326,7 +326,7 @@ def validate_mysql_data(**context):
         
         if row_count == 0:
             raise ValueError(" Validation failed: Table is empty!")
-        logger.info(f"✓ Row count: {row_count}")
+        logger.info(f"Row count: {row_count}")
         
         # Check 2: Unique booking_hash (no duplicates)
         cursor.execute("""
@@ -339,9 +339,9 @@ def validate_mysql_data(**context):
         validation_results['duplicate_hashes'] = dup_count
         
         if dup_count > 0:
-            logger.warning(f"⚠ Found {dup_count} duplicate booking hashes")
+            logger.warning(f"Found {dup_count} duplicate booking hashes")
         else:
-            logger.info("✓ No duplicate booking hashes")
+            logger.info("No duplicate booking hashes")
         
         # Check 3: Null check for critical columns
         for col in ['airline', 'source', 'destination', 'booking_hash']:
@@ -351,7 +351,7 @@ def validate_mysql_data(**context):
             if null_count > 0:
                 logger.warning(f" Found {null_count} null/empty values in '{col}'")
             else:
-                logger.info(f"✓ No nulls in '{col}'")
+                logger.info(f"No nulls in '{col}'")
         
         # Check 4: Numeric field validation
         cursor.execute("""

@@ -6,11 +6,11 @@ An end-to-end data engineering pipeline using **Apache Airflow** and **dbt** wit
 
 ### Key Features
 
-- 🚀 **Optimized Performance**: Bulk inserts with 10,000 row chunks
-- 🔄 **Incremental Load**: Upsert support for handling updates
-- 📁 **Multi-CSV Support**: Process all CSVs in a folder
-- 🔑 **Deduplication**: Composite hash key for unique bookings
-- ⚡ **Incremental dbt**: Only processes changed data
+- **Optimized Performance**: Bulk inserts with 10,000 row chunks
+- **Incremental Load**: Upsert support for handling updates
+- **Multi-CSV Support**: Process all CSVs in a folder
+- **Deduplication**: Composite hash key for unique bookings
+- **Incremental dbt**: Only processes changed data
 
 ```mermaid
 flowchart LR
@@ -35,7 +35,7 @@ flowchart LR
 
 ---
 
-## 🆕 Optimization Features (v2)
+## Optimization Features (v2)
 
 ### 1. Incremental Load with Upsert
 
@@ -66,7 +66,7 @@ Silver layer only processes new/updated rows:
 
 ---
 
-## 🚀 RUN GUIDE
+## RUN GUIDE
 
 ### Prerequisites
 
@@ -128,7 +128,7 @@ docker-compose ps
 
 ---
 
-## ✅ TEST GUIDE
+## TEST GUIDE
 
 ### Verify Bronze Layer (MySQL)
 
@@ -187,7 +187,7 @@ Done. PASS=7 ERROR=0
 
 ---
 
-## 🔧 TROUBLESHOOTING GUIDE
+## TROUBLESHOOTING GUIDE
 
 ### dbt Command Not Found
 
