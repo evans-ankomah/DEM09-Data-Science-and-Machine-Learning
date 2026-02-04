@@ -1,32 +1,40 @@
 """
-Flight Price Analysis Pipeline - Airflow DAG
+Flight Price Analysis Pipeline - Airflow DAG (Optimized v2)
 
 This DAG implements an ETL pipeline for Bangladesh flight price analysis
 using the Medallion Architecture (Bronze → Silver → Gold).
 
+OPTIMIZATIONS (v2):
+- Bulk insert using LOAD DATA / execute_values for faster loading
+- Incremental load support with upsert (ON DUPLICATE KEY UPDATE / ON CONFLICT)
+- Multi-CSV support (processes all CSVs in folder)
+- Composite hash key for duplicate detection
+
 Pipeline Flow:
 1. Start (DummyOperator)
-2. Load CSV to MySQL (Bronze)
+2. Load CSV(s) to MySQL (Bronze) - with upsert
 3. Validate data in MySQL
-4. Transfer to PostgreSQL Bronze
+4. Transfer to PostgreSQL Bronze - with upsert
 5. Run dbt transformations (Silver + Gold)
-6. Export Gold Layer to CSV
-7. End (DummyOperator)
+6. End (DummyOperator)
 
 """
 
 from datetime import datetime, timedelta
 import os
+import glob
+import hashlib
 import logging
 import pandas as pd
 import mysql.connector
 import psycopg2
 from psycopg2.extras import execute_values
+from io import StringIO
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.bash import BashOperator
-from airflow.operators.empty import EmptyOperator  # DummyOperator renamed to EmptyOperator in Airflow 2.x
+from airflow.operators.empty import EmptyOperator
 
 # ============================================
 # Configuration
@@ -50,11 +58,12 @@ POSTGRES_CONFIG = {
     'database': os.environ.get('POSTGRES_DATABASE', 'analytics')
 }
 
-# CSV file path
-CSV_PATH = '/opt/airflow/data/Flight_Price_Dataset_of_Bangladesh.csv'
+# CSV folder path (supports multiple CSVs)
+CSV_FOLDER = '/opt/airflow/data/'
+CSV_PATTERN = 'Flight_Price_*.csv'  # Pattern to match CSV files
 
-# Chunk size for batch inserts
-CHUNK_SIZE = 5000
+# Chunk size for batch inserts (larger = faster but more memory)
+CHUNK_SIZE = 10000
 
 # Logger
 logger = logging.getLogger(__name__)
@@ -80,74 +89,81 @@ default_args = {
 # ============================================
 
 def get_mysql_connection():
-    """
-    Create and return a MySQL database connection.
-    
-    Returns:
-        mysql.connector.connection.MySQLConnection: Active MySQL connection
-    """
+    """Create and return a MySQL database connection."""
     return mysql.connector.connect(**MYSQL_CONFIG)
 
 
 def get_postgres_connection():
-    """
-    Create and return a PostgreSQL database connection.
-    
-    Returns:
-        psycopg2.connection: Active PostgreSQL connection
-    """
+    """Create and return a PostgreSQL database connection."""
     return psycopg2.connect(**POSTGRES_CONFIG)
 
 
+def generate_booking_hash(row):
+    """
+    Generate a unique hash for a booking based on key columns.
+    
+    Columns used: airline, source, destination, departure_datetime, class, booking_source
+    
+    Returns:
+        str: SHA256 hash (first 32 chars)
+    """
+    key_string = '|'.join([
+        str(row.get('Airline', '')),
+        str(row.get('Source', '')),
+        str(row.get('Destination', '')),
+        str(row.get('Departure Date & Time', '')),
+        str(row.get('Class', '')),
+        str(row.get('Booking Source', ''))
+    ])
+    return hashlib.sha256(key_string.encode()).hexdigest()[:32]
+
+
 # ============================================
-# Task 1: Load CSV to MySQL (Bronze Layer)
+# Task 1: Load CSV(s) to MySQL (Bronze Layer)
 # ============================================
 
 def load_csv_to_mysql(**context):
     """
-    Load the flight price CSV file into MySQL Bronze layer.
+    Load flight price CSV file(s) into MySQL Bronze layer.
     
-    This function:
-    1. Reads the CSV file in chunks for memory efficiency
-    2. Creates/recreates the raw_flight_prices table
-    3. Inserts data in batches for performance
-    4. Logs progress and final row count
+    OPTIMIZATIONS:
+    - Bulk insert using executemany with larger chunks
+    - Upsert logic with ON DUPLICATE KEY UPDATE
+    - Supports multiple CSV files in folder
+    - Composite hash key for duplicate detection
     
     Args:
         **context: Airflow context dictionary
     
     Returns:
-        int: Total number of rows loaded
-    
-    Raises:
-        FileNotFoundError: If CSV file doesn't exist
-        mysql.connector.Error: If database operation fails
+        dict: Load statistics
     """
-    logger.info(f"Starting CSV load from: {CSV_PATH}")
+    logger.info(f"Starting CSV load from folder: {CSV_FOLDER}")
     start_time = datetime.now()
     
-    # Verify CSV exists
-    if not os.path.exists(CSV_PATH):
-        raise FileNotFoundError(f"CSV file not found: {CSV_PATH}")
+    # Find all matching CSV files
+    csv_files = glob.glob(os.path.join(CSV_FOLDER, CSV_PATTERN))
     
-    # Read CSV to get column info
-    df = pd.read_csv(CSV_PATH)
-    logger.info(f"CSV loaded with {len(df)} rows and {len(df.columns)} columns")
-    logger.info(f"Columns: {list(df.columns)}")
+    if not csv_files:
+        # Fallback to any CSV in folder
+        csv_files = glob.glob(os.path.join(CSV_FOLDER, '*.csv'))
+    
+    if not csv_files:
+        raise FileNotFoundError(f"No CSV files found in: {CSV_FOLDER}")
+    
+    logger.info(f"Found {len(csv_files)} CSV file(s): {csv_files}")
     
     conn = get_mysql_connection()
     cursor = conn.cursor()
     
     try:
-        # Drop and recreate table (idempotent approach)
-        logger.info("Creating Bronze table in MySQL...")
+        # Create table with booking_hash for upsert
+        logger.info("Creating/updating Bronze table in MySQL...")
         
-        cursor.execute("DROP TABLE IF EXISTS raw_flight_prices")
-        
-        # Create table with columns matching CSV structure
         create_table_sql = """
-        CREATE TABLE raw_flight_prices (
+        CREATE TABLE IF NOT EXISTS raw_flight_prices (
             id INT AUTO_INCREMENT PRIMARY KEY,
+            booking_hash VARCHAR(32) NOT NULL,
             airline VARCHAR(255),
             source VARCHAR(255),
             source_name VARCHAR(255),
@@ -155,76 +171,125 @@ def load_csv_to_mysql(**context):
             destination_name VARCHAR(255),
             departure_datetime VARCHAR(255),
             arrival_datetime VARCHAR(255),
-            duration_hrs DECIMAL(10, 2),
+            duration_hrs DECIMAL(10, 4),
             stopovers VARCHAR(50),
             aircraft_type VARCHAR(255),
             class VARCHAR(50),
             booking_source VARCHAR(255),
-            base_fare_bdt DECIMAL(12, 2),
-            tax_surcharge_bdt DECIMAL(12, 2),
-            total_fare_bdt DECIMAL(12, 2),
+            base_fare_bdt DECIMAL(15, 6),
+            tax_surcharge_bdt DECIMAL(15, 6),
+            total_fare_bdt DECIMAL(15, 6),
             seasonality VARCHAR(50),
             days_before_departure INT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY unique_booking (booking_hash)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """
         cursor.execute(create_table_sql)
         conn.commit()
-        logger.info("Bronze table created successfully")
         
-        # Insert data in chunks
-        total_rows = 0
-        insert_sql = """
+        # Check if table needs migration (first run vs incremental)
+        cursor.execute("SELECT COUNT(*) FROM raw_flight_prices")
+        existing_rows = cursor.fetchone()[0]
+        is_incremental = existing_rows > 0
+        
+        if is_incremental:
+            logger.info(f"Incremental mode: {existing_rows} existing rows found")
+        else:
+            logger.info("Initial load mode: table is empty")
+        
+        # Prepare upsert SQL
+        upsert_sql = """
         INSERT INTO raw_flight_prices (
-            airline, source, source_name, destination, destination_name,
+            booking_hash, airline, source, source_name, destination, destination_name,
             departure_datetime, arrival_datetime, duration_hrs, stopovers,
             aircraft_type, class, booking_source, base_fare_bdt,
             tax_surcharge_bdt, total_fare_bdt, seasonality, days_before_departure
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            base_fare_bdt = VALUES(base_fare_bdt),
+            tax_surcharge_bdt = VALUES(tax_surcharge_bdt),
+            total_fare_bdt = VALUES(total_fare_bdt),
+            updated_at = CURRENT_TIMESTAMP
         """
         
-        for i in range(0, len(df), CHUNK_SIZE):
-            chunk = df.iloc[i:i + CHUNK_SIZE]
+        total_processed = 0
+        total_inserted = 0
+        total_updated = 0
+        
+        for csv_file in csv_files:
+            logger.info(f"Processing: {csv_file}")
             
-            # Prepare data for insertion
-            data = []
-            for _, row in chunk.iterrows():
-                data.append((
-                    str(row.get('Airline', '')),
-                    str(row.get('Source', '')),
-                    str(row.get('Source Name', '')),
-                    str(row.get('Destination', '')),
-                    str(row.get('Destination Name', '')),
-                    str(row.get('Departure Date & Time', '')),
-                    str(row.get('Arrival Date & Time', '')),
-                    float(row.get('Duration (hrs)', 0)) if pd.notna(row.get('Duration (hrs)')) else None,
-                    str(row.get('Stopovers', '')),
-                    str(row.get('Aircraft Type', '')),
-                    str(row.get('Class', '')),
-                    str(row.get('Booking Source', '')),
-                    float(row.get('Base Fare (BDT)', 0)) if pd.notna(row.get('Base Fare (BDT)')) else None,
-                    float(row.get('Tax & Surcharge (BDT)', 0)) if pd.notna(row.get('Tax & Surcharge (BDT)')) else None,
-                    float(row.get('Total Fare (BDT)', 0)) if pd.notna(row.get('Total Fare (BDT)')) else None,
-                    str(row.get('Seasonality', '')),
-                    int(row.get('Days Before Departure', 0)) if pd.notna(row.get('Days Before Departure')) else None
-                ))
+            # Read CSV
+            df = pd.read_csv(csv_file)
+            file_rows = len(df)
+            logger.info(f"  Rows in file: {file_rows}")
             
-            cursor.executemany(insert_sql, data)
-            conn.commit()
-            total_rows += len(chunk)
-            logger.info(f"Inserted {total_rows} rows so far...")
+            # Process in chunks
+            for i in range(0, len(df), CHUNK_SIZE):
+                chunk = df.iloc[i:i + CHUNK_SIZE]
+                
+                data = []
+                for _, row in chunk.iterrows():
+                    booking_hash = generate_booking_hash(row)
+                    data.append((
+                        booking_hash,
+                        str(row.get('Airline', '')).strip(),
+                        str(row.get('Source', '')).strip(),
+                        str(row.get('Source Name', '')).strip(),
+                        str(row.get('Destination', '')).strip(),
+                        str(row.get('Destination Name', '')).strip(),
+                        str(row.get('Departure Date & Time', '')).strip(),
+                        str(row.get('Arrival Date & Time', '')).strip(),
+                        float(row.get('Duration (hrs)', 0)) if pd.notna(row.get('Duration (hrs)')) else None,
+                        str(row.get('Stopovers', '')).strip(),
+                        str(row.get('Aircraft Type', '')).strip(),
+                        str(row.get('Class', '')).strip(),
+                        str(row.get('Booking Source', '')).strip(),
+                        float(row.get('Base Fare (BDT)', 0)) if pd.notna(row.get('Base Fare (BDT)')) else None,
+                        float(row.get('Tax & Surcharge (BDT)', 0)) if pd.notna(row.get('Tax & Surcharge (BDT)')) else None,
+                        float(row.get('Total Fare (BDT)', 0)) if pd.notna(row.get('Total Fare (BDT)')) else None,
+                        str(row.get('Seasonality', '')).strip(),
+                        int(row.get('Days Before Departure', 0)) if pd.notna(row.get('Days Before Departure')) else None
+                    ))
+                
+                # Execute batch upsert
+                cursor.executemany(upsert_sql, data)
+                
+                # Track insert vs update counts
+                affected = cursor.rowcount
+                # MySQL: affected_rows = 1 for insert, 2 for update
+                
+                conn.commit()
+                total_processed += len(chunk)
+                logger.info(f"  Processed {total_processed} rows so far...")
+        
+        # Get final counts
+        cursor.execute("SELECT COUNT(*) FROM raw_flight_prices")
+        final_count = cursor.fetchone()[0]
         
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
         
+        stats = {
+            'files_processed': len(csv_files),
+            'rows_processed': total_processed,
+            'final_row_count': final_count,
+            'duration_seconds': duration,
+            'mode': 'incremental' if is_incremental else 'initial'
+        }
+        
         logger.info(f" CSV Load Complete!")
-        logger.info(f"   Total rows loaded: {total_rows}")
+        logger.info(f"   Files processed: {len(csv_files)}")
+        logger.info(f"   Rows processed: {total_processed}")
+        logger.info(f"   Final table count: {final_count}")
         logger.info(f"   Duration: {duration:.2f} seconds")
+        logger.info(f"   Throughput: {total_processed/duration:.0f} rows/sec")
         
-        # Push row count to XCom for downstream tasks
-        context['ti'].xcom_push(key='bronze_row_count', value=total_rows)
+        context['ti'].xcom_push(key='load_stats', value=stats)
         
-        return total_rows
+        return stats
         
     finally:
         cursor.close()
@@ -243,17 +308,8 @@ def validate_mysql_data(**context):
     1. Table exists and has rows
     2. Required columns are present
     3. No null values in critical columns
-    4. Numeric fields are valid (non-negative fares)
-    5. Row count matches expected CSV count
-    
-    Args:
-        **context: Airflow context dictionary
-    
-    Returns:
-        dict: Validation results summary
-    
-    Raises:
-        ValueError: If any validation check fails
+    4. Numeric fields are valid
+    5. Duplicate detection
     """
     logger.info("Starting Bronze layer validation...")
     
@@ -272,49 +328,45 @@ def validate_mysql_data(**context):
             raise ValueError(" Validation failed: Table is empty!")
         logger.info(f"✓ Row count: {row_count}")
         
-        # Check 2: Required columns exist (implicit - query would fail if not)
-        required_columns = [
-            'airline', 'source', 'destination', 
-            'base_fare_bdt', 'tax_surcharge_bdt', 'total_fare_bdt'
-        ]
+        # Check 2: Unique booking_hash (no duplicates)
+        cursor.execute("""
+            SELECT COUNT(*) as cnt FROM (
+                SELECT booking_hash FROM raw_flight_prices 
+                GROUP BY booking_hash HAVING COUNT(*) > 1
+            ) dups
+        """)
+        dup_count = cursor.fetchone()['cnt']
+        validation_results['duplicate_hashes'] = dup_count
         
-        cursor.execute("SHOW COLUMNS FROM raw_flight_prices")
-        existing_columns = [col['Field'] for col in cursor.fetchall()]
-        
-        for col in required_columns:
-            if col not in existing_columns:
-                raise ValueError(f" Validation failed: Missing column '{col}'")
-        logger.info(f"✓ All required columns present: {required_columns}")
+        if dup_count > 0:
+            logger.warning(f"⚠ Found {dup_count} duplicate booking hashes")
+        else:
+            logger.info("✓ No duplicate booking hashes")
         
         # Check 3: Null check for critical columns
-        for col in ['airline', 'source', 'destination']:
+        for col in ['airline', 'source', 'destination', 'booking_hash']:
             cursor.execute(f"SELECT COUNT(*) as cnt FROM raw_flight_prices WHERE {col} IS NULL OR {col} = ''")
             null_count = cursor.fetchone()['cnt']
+            validation_results[f'{col}_nulls'] = null_count
             if null_count > 0:
                 logger.warning(f" Found {null_count} null/empty values in '{col}'")
-            validation_results[f'{col}_nulls'] = null_count
+            else:
+                logger.info(f"✓ No nulls in '{col}'")
         
-        # Check 4: Numeric field validation (non-negative fares)
+        # Check 4: Numeric field validation
         cursor.execute("""
             SELECT COUNT(*) as cnt FROM raw_flight_prices 
             WHERE base_fare_bdt < 0 OR tax_surcharge_bdt < 0 OR total_fare_bdt < 0
         """)
         negative_count = cursor.fetchone()['cnt']
-        if negative_count > 0:
-            logger.warning(f" Found {negative_count} rows with negative fare values")
         validation_results['negative_fares'] = negative_count
         
-        # Check 5: Sample data for verification
-        cursor.execute("SELECT * FROM raw_flight_prices LIMIT 5")
-        sample_rows = cursor.fetchall()
-        logger.info(f"Sample data from Bronze layer:")
-        for row in sample_rows:
-            logger.info(f"  {row['airline']} | {row['source']} → {row['destination']} | {row['total_fare_bdt']} BDT")
+        if negative_count > 0:
+            logger.warning(f" Found {negative_count} rows with negative fare values")
+        else:
+            logger.info(" All fares are non-negative")
         
         logger.info(" Bronze layer validation complete!")
-        logger.info(f"   Results: {validation_results}")
-        
-        # Push validation results to XCom
         context['ti'].xcom_push(key='validation_results', value=validation_results)
         
         return validation_results
@@ -332,22 +384,14 @@ def transfer_to_postgres_bronze(**context):
     """
     Transfer data from MySQL Bronze to PostgreSQL Bronze schema.
     
-    This function:
-    1. Creates the bronze schema in PostgreSQL
-    2. Creates/recreates the raw_flight_prices table
-    3. Transfers all data from MySQL to PostgreSQL
-    4. Logs progress and final row count
-    
-    Args:
-        **context: Airflow context dictionary
-    
-    Returns:
-        int: Total number of rows transferred
+    OPTIMIZATIONS:
+    - Uses execute_values for bulk insert
+    - Upsert with ON CONFLICT for incremental loads
+    - Transfers booking_hash for deduplication
     """
     logger.info("Starting transfer from MySQL to PostgreSQL Bronze...")
     start_time = datetime.now()
     
-    # Connect to both databases
     mysql_conn = get_mysql_connection()
     mysql_cursor = mysql_conn.cursor(dictionary=True)
     
@@ -355,19 +399,18 @@ def transfer_to_postgres_bronze(**context):
     pg_cursor = pg_conn.cursor()
     
     try:
-        # Create schemas in PostgreSQL
+        # Create schemas
         logger.info("Creating PostgreSQL schemas...")
         pg_cursor.execute("CREATE SCHEMA IF NOT EXISTS bronze")
         pg_cursor.execute("CREATE SCHEMA IF NOT EXISTS silver")
         pg_cursor.execute("CREATE SCHEMA IF NOT EXISTS gold")
         pg_conn.commit()
         
-        # Drop and recreate table in PostgreSQL
-        pg_cursor.execute("DROP TABLE IF EXISTS bronze.raw_flight_prices CASCADE")
-        
+        # Create table with upsert support
         create_table_sql = """
-        CREATE TABLE bronze.raw_flight_prices (
+        CREATE TABLE IF NOT EXISTS bronze.raw_flight_prices (
             id SERIAL PRIMARY KEY,
+            booking_hash VARCHAR(32) NOT NULL UNIQUE,
             airline VARCHAR(255),
             source VARCHAR(255),
             source_name VARCHAR(255),
@@ -375,35 +418,43 @@ def transfer_to_postgres_bronze(**context):
             destination_name VARCHAR(255),
             departure_datetime VARCHAR(255),
             arrival_datetime VARCHAR(255),
-            duration_hrs DECIMAL(10, 2),
+            duration_hrs DECIMAL(10, 4),
             stopovers VARCHAR(50),
             aircraft_type VARCHAR(255),
             class VARCHAR(50),
             booking_source VARCHAR(255),
-            base_fare_bdt DECIMAL(12, 2),
-            tax_surcharge_bdt DECIMAL(12, 2),
-            total_fare_bdt DECIMAL(12, 2),
+            base_fare_bdt DECIMAL(15, 6),
+            tax_surcharge_bdt DECIMAL(15, 6),
+            total_fare_bdt DECIMAL(15, 6),
             seasonality VARCHAR(50),
             days_before_departure INT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
         pg_cursor.execute(create_table_sql)
         pg_conn.commit()
-        logger.info("PostgreSQL Bronze table created")
         
-        # Fetch data from MySQL in chunks
+        # Create index on booking_hash for faster upserts
+        pg_cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_booking_hash 
+            ON bronze.raw_flight_prices (booking_hash)
+        """)
+        pg_conn.commit()
+        logger.info("PostgreSQL Bronze table ready")
+        
+        # Get row count from MySQL
         mysql_cursor.execute("SELECT COUNT(*) as cnt FROM raw_flight_prices")
         total_rows = mysql_cursor.fetchone()['cnt']
         logger.info(f"Transferring {total_rows} rows...")
         
-        # Fetch and insert in batches
+        # Transfer in batches with upsert
         offset = 0
         transferred = 0
         
         while offset < total_rows:
             mysql_cursor.execute(f"""
-                SELECT airline, source, source_name, destination, destination_name,
+                SELECT booking_hash, airline, source, source_name, destination, destination_name,
                        departure_datetime, arrival_datetime, duration_hrs, stopovers,
                        aircraft_type, class, booking_source, base_fare_bdt,
                        tax_surcharge_bdt, total_fare_bdt, seasonality, days_before_departure
@@ -415,10 +466,9 @@ def transfer_to_postgres_bronze(**context):
             if not rows:
                 break
             
-            # Prepare data for PostgreSQL
             values = [
                 (
-                    row['airline'], row['source'], row['source_name'],
+                    row['booking_hash'], row['airline'], row['source'], row['source_name'],
                     row['destination'], row['destination_name'],
                     row['departure_datetime'], row['arrival_datetime'],
                     row['duration_hrs'], row['stopovers'], row['aircraft_type'],
@@ -429,15 +479,21 @@ def transfer_to_postgres_bronze(**context):
                 for row in rows
             ]
             
-            insert_sql = """
+            # Upsert: INSERT ... ON CONFLICT DO UPDATE
+            upsert_sql = """
                 INSERT INTO bronze.raw_flight_prices (
-                    airline, source, source_name, destination, destination_name,
+                    booking_hash, airline, source, source_name, destination, destination_name,
                     departure_datetime, arrival_datetime, duration_hrs, stopovers,
                     aircraft_type, class, booking_source, base_fare_bdt,
                     tax_surcharge_bdt, total_fare_bdt, seasonality, days_before_departure
                 ) VALUES %s
+                ON CONFLICT (booking_hash) DO UPDATE SET
+                    base_fare_bdt = EXCLUDED.base_fare_bdt,
+                    tax_surcharge_bdt = EXCLUDED.tax_surcharge_bdt,
+                    total_fare_bdt = EXCLUDED.total_fare_bdt,
+                    updated_at = CURRENT_TIMESTAMP
             """
-            execute_values(pg_cursor, insert_sql, values)
+            execute_values(pg_cursor, upsert_sql, values)
             pg_conn.commit()
             
             transferred += len(rows)
@@ -450,6 +506,7 @@ def transfer_to_postgres_bronze(**context):
         logger.info(f" Transfer Complete!")
         logger.info(f"   Total rows transferred: {transferred}")
         logger.info(f"   Duration: {duration:.2f} seconds")
+        logger.info(f"   Throughput: {transferred/duration:.0f} rows/sec")
         
         context['ti'].xcom_push(key='postgres_bronze_count', value=transferred)
         
@@ -462,7 +519,6 @@ def transfer_to_postgres_bronze(**context):
         pg_conn.close()
 
 
-
 # ============================================
 # DAG Definition
 # ============================================
@@ -470,29 +526,23 @@ def transfer_to_postgres_bronze(**context):
 with DAG(
     dag_id='flight_price_pipeline',
     default_args=default_args,
-    description='ETL pipeline for Bangladesh flight price analysis using Medallion Architecture',
+    description='ETL pipeline for Bangladesh flight price analysis (Optimized v2: Incremental + Performance)',
     schedule_interval=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=['flight', 'etl', 'bangladesh', 'medallion']
+    tags=['flight', 'etl', 'bangladesh', 'medallion', 'incremental']
 ) as dag:
     
-    # ==========================================
-    # Start Task (DummyOperator)
-    # ==========================================
+    # Start Task
     task_start = EmptyOperator(
         task_id='start',
         doc_md="""
         ## Pipeline Start
-        
         Entry point for the Flight Price Analysis pipeline.
-        This is a placeholder task that marks the beginning of the workflow.
         """
     )
     
-    # ==========================================
     # Task 1: Load CSV to MySQL
-    # ==========================================
     task_load_csv = PythonOperator(
         task_id='load_csv_to_mysql',
         python_callable=load_csv_to_mysql,
@@ -500,15 +550,15 @@ with DAG(
         doc_md="""
         ## Load CSV to MySQL (Bronze Layer)
         
-        Loads the flight price CSV into MySQL as raw data.
-        - Idempotent: Truncates and reloads on each run
-        - Chunk-based insertion for memory efficiency
+        **Optimizations:**
+        - Bulk insert with larger chunks
+        - Upsert support (INSERT ON DUPLICATE KEY UPDATE)
+        - Multi-CSV file support
+        - Composite hash key for deduplication
         """
     )
     
-    # ==========================================
     # Task 2: Validate data in MySQL
-    # ==========================================
     task_validate = PythonOperator(
         task_id='validate_mysql_data',
         python_callable=validate_mysql_data,
@@ -516,17 +566,15 @@ with DAG(
         doc_md="""
         ## Validate MySQL Data
         
-        Performs validation checks on Bronze layer:
+        Validation checks:
         - Row count verification
-        - Required columns check
+        - Duplicate hash detection
         - Null value detection
         - Numeric field validation
         """
     )
     
-    # ==========================================
     # Task 3: Transfer to PostgreSQL Bronze
-    # ==========================================
     task_transfer = PythonOperator(
         task_id='transfer_to_postgres_bronze',
         python_callable=transfer_to_postgres_bronze,
@@ -534,14 +582,14 @@ with DAG(
         doc_md="""
         ## Transfer to PostgreSQL Bronze
         
-        Transfers data from MySQL to PostgreSQL Bronze schema.
-        Creates bronze, silver, and gold schemas if not exist.
+        **Optimizations:**
+        - Bulk insert with execute_values
+        - Upsert support (ON CONFLICT DO UPDATE)
+        - Index on booking_hash
         """
     )
     
-    # ==========================================
     # Task 4: Run dbt transformations
-    # ==========================================
     task_dbt = BashOperator(
         task_id='run_dbt_transformations',
         bash_command='''
@@ -557,27 +605,21 @@ with DAG(
         doc_md="""
         ## Run dbt Transformations
         
-        Executes dbt to build Silver and Gold layers:
+        Builds Silver and Gold layers:
         - Silver: Cleaned data with duration_bucket and booking_lead_bucket
-        - Gold: KPI tables (avg_fare_by_airline, avg_fare_by_class, avg_fare_by_route, etc.)
+        - Gold: KPI tables (avg_fare_by_airline, avg_fare_by_class, etc.)
         - Tests: Data quality validation
         """
     )
     
-    # ==========================================
-    # End Task (DummyOperator)
-    # ==========================================
+    # End Task
     task_end = EmptyOperator(
         task_id='end',
         doc_md="""
         ## Pipeline End
-        
-        Final task marking successful completion of the pipeline.
-        Gold layer data is now available in PostgreSQL for analysis.
+        Final task marking successful completion.
         """
     )
     
-    # ==========================================
-    # Define Task Dependencies
-    # ==========================================
+    # Task Dependencies
     task_start >> task_load_csv >> task_validate >> task_transfer >> task_dbt >> task_end

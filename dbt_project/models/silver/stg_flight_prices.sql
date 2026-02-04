@@ -1,6 +1,6 @@
 /*
 ============================================
-Silver Layer: Staged Flight Prices
+Silver Layer: Staged Flight Prices (Incremental)
 ============================================
 
 Purpose:
@@ -8,6 +8,10 @@ Purpose:
 
 Source: bronze.raw_flight_prices
 Target: silver.stg_flight_prices
+
+OPTIMIZATION: Uses incremental materialization for faster updates.
+  - Only processes new/updated rows based on updated_at timestamp
+  - Uses booking_hash as unique key for merge strategy
 
 Transformations Applied:
   1. Trim whitespace from text fields
@@ -19,15 +23,18 @@ Transformations Applied:
 */
 
 {{ config(
-    materialized='table',
+    materialized='incremental',
     schema='silver',
-    tags=['silver', 'staging']
+    unique_key='booking_hash',
+    incremental_strategy='delete+insert',
+    tags=['silver', 'staging', 'incremental']
 ) }}
 
 WITH source_data AS (
     -- Select raw data from Bronze layer
     SELECT
         id,
+        booking_hash,
         airline,
         source,
         source_name,
@@ -45,14 +52,21 @@ WITH source_data AS (
         total_fare_bdt,
         seasonality,
         days_before_departure,
-        created_at
+        created_at,
+        updated_at
     FROM {{ source('bronze', 'raw_flight_prices') }}
+    
+    {% if is_incremental() %}
+        -- Only get new or updated rows since last run
+        WHERE updated_at > (SELECT COALESCE(MAX(updated_at), '1900-01-01') FROM {{ this }})
+    {% endif %}
 ),
 
 cleaned_data AS (
     -- Clean and standardize the data
     SELECT
         id,
+        booking_hash,
         
         -- Trim and standardize text fields
         TRIM(airline) AS airline,
@@ -92,12 +106,14 @@ cleaned_data AS (
         TRIM(seasonality) AS seasonality,
         
         COALESCE(days_before_departure, 0) AS days_before_departure,
-        created_at
+        created_at,
+        updated_at
     FROM source_data
 )
 
 SELECT
     id,
+    booking_hash,
     airline,
     source,
     source_name,
@@ -107,7 +123,7 @@ SELECT
     arrival_datetime,
     duration_hrs,
     
-    -- NEW: Duration Bucket (categorize flight length)
+    -- Duration Bucket (categorize flight length)
     CASE
         WHEN duration_hrs <= 3 THEN 'Short (0-3h)'
         WHEN duration_hrs <= 6 THEN 'Medium (3-6h)'
@@ -124,7 +140,7 @@ SELECT
     seasonality,
     days_before_departure,
     
-    -- NEW: Booking Lead Time Bucket (how far in advance was booking made)
+    -- Booking Lead Time Bucket
     CASE
         WHEN days_before_departure <= 3 THEN 'Last Minute (0-3 days)'
         WHEN days_before_departure <= 14 THEN 'Short Notice (4-14 days)'
@@ -133,5 +149,6 @@ SELECT
     END AS booking_lead_bucket,
     
     created_at,
+    updated_at,
     CURRENT_TIMESTAMP AS processed_at
 FROM cleaned_data

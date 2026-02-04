@@ -116,19 +116,16 @@ postgres            Up (healthy)
 postgres-airflow    Up (healthy)
 ```
 
-### Step 3.4: Install dbt in Airflow Container (First Time Only)
+### Step 3.4: dbt Auto-Installation (Automatic)
 
+> **Note**: dbt is now **automatically installed** in the scheduler container on startup. No manual installation required!
+
+To verify dbt is installed:
 ```powershell
-docker exec -u airflow airflow-scheduler python -m pip install --user dbt-postgres==1.7.0
+docker exec airflow-scheduler dbt --version
 ```
 
-Wait ~2 minutes for installation to complete.
-
-### Step 3.5: Install dbt Dependencies
-
-```powershell
-docker exec -u airflow airflow-scheduler bash -c "cd /opt/airflow/dbt_project && /home/airflow/.local/bin/dbt deps --profiles-dir ."
-```
+**Expected output**: `dbt-core: 1.7.0, postgres: 1.7.0`
 
 ---
 
@@ -185,16 +182,24 @@ docker exec mysql mysql -u root -proot flight_bronze -e "SELECT COUNT(*) as rows
 ### Step 5.2: Check Silver Layer (PostgreSQL)
 
 ```powershell
-docker exec postgres psql -U postgres -d analytics -c "SELECT COUNT(*) FROM silver.stg_flight_prices;"
+docker exec postgres psql -U postgres -d analytics -c "SELECT COUNT(*) FROM public_silver.stg_flight_prices;"
 ```
 
 **Expected: 57,000 rows**
+
+### Step 5.2b: Verify booking_hash Column (v2 Feature)
+
+```powershell
+docker exec postgres psql -U postgres -d analytics -c "SELECT booking_hash, airline FROM bronze.raw_flight_prices LIMIT 3;"
+```
+
+**Expected**: Rows with 32-character hash values
 
 ### Step 5.3: Check New Transformations
 
 **Duration Buckets:**
 ```powershell
-docker exec postgres psql -U postgres -d analytics -c "SELECT DISTINCT duration_bucket FROM silver.stg_flight_prices ORDER BY 1;"
+docker exec postgres psql -U postgres -d analytics -c "SELECT DISTINCT duration_bucket FROM public_silver.stg_flight_prices ORDER BY 1;"
 ```
 
 **Expected values:**
@@ -204,7 +209,7 @@ docker exec postgres psql -U postgres -d analytics -c "SELECT DISTINCT duration_
 
 **Booking Lead Buckets:**
 ```powershell
-docker exec postgres psql -U postgres -d analytics -c "SELECT DISTINCT booking_lead_bucket FROM silver.stg_flight_prices ORDER BY 1;"
+docker exec postgres psql -U postgres -d analytics -c "SELECT DISTINCT booking_lead_bucket FROM public_silver.stg_flight_prices ORDER BY 1;"
 ```
 
 **Expected values:**
@@ -217,17 +222,17 @@ docker exec postgres psql -U postgres -d analytics -c "SELECT DISTINCT booking_l
 
 ```powershell
 docker exec postgres psql -U postgres -d analytics -c "
-SELECT 'avg_fare_by_airline' as table_name, COUNT(*) as rows FROM gold.avg_fare_by_airline
+SELECT 'avg_fare_by_airline' as table_name, COUNT(*) as rows FROM public_gold.avg_fare_by_airline
 UNION ALL
-SELECT 'avg_fare_by_class', COUNT(*) FROM gold.avg_fare_by_class
+SELECT 'avg_fare_by_class', COUNT(*) FROM public_gold.avg_fare_by_class
 UNION ALL
-SELECT 'avg_fare_by_route', COUNT(*) FROM gold.avg_fare_by_route
+SELECT 'avg_fare_by_route', COUNT(*) FROM public_gold.avg_fare_by_route
 UNION ALL
-SELECT 'booking_count_by_airline', COUNT(*) FROM gold.booking_count_by_airline
+SELECT 'booking_count_by_airline', COUNT(*) FROM public_gold.booking_count_by_airline
 UNION ALL
-SELECT 'top_routes', COUNT(*) FROM gold.top_routes
+SELECT 'top_routes', COUNT(*) FROM public_gold.top_routes
 UNION ALL
-SELECT 'seasonal_fare_variation', COUNT(*) FROM gold.seasonal_fare_variation;
+SELECT 'seasonal_fare_variation', COUNT(*) FROM public_gold.seasonal_fare_variation;
 "
 ```
 

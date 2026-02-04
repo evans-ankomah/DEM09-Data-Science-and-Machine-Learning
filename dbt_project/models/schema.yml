@@ -1,6 +1,6 @@
 # ============================================
 # dbt Sources and Model Schema
-# Flight Price Analysis - Medallion Architecture
+# Flight Price Analysis - Medallion Architecture (v2 - Incremental)
 # ============================================
 
 version: 2
@@ -10,15 +10,17 @@ version: 2
 # ============================================
 sources:
   - name: bronze
-    description: "Bronze layer - Raw flight price data from CSV"
+    description: "Bronze layer - Raw flight price data with upsert support"
     database: analytics
     schema: bronze
     tables:
       - name: raw_flight_prices
-        description: "Raw flight price data loaded from Bangladesh dataset"
+        description: "Raw flight price data with booking_hash for deduplication"
         columns:
           - name: id
             description: "Auto-generated primary key"
+          - name: booking_hash
+            description: "Composite hash for unique booking identification (airline+source+destination+departure+class+booking_source)"
           - name: airline
             description: "Name of the airline operating the flight"
           - name: source
@@ -53,14 +55,21 @@ sources:
             description: "Season label from original dataset (Regular, Eid, Hajj, Winter)"
           - name: days_before_departure
             description: "Number of days between booking and departure"
+          - name: created_at
+            description: "Record creation timestamp"
+          - name: updated_at
+            description: "Record last update timestamp (for incremental loads)"
 
 # ============================================
-# Models: Silver Layer
+# Models: Silver Layer (Incremental)
 # ============================================
 models:
   - name: stg_flight_prices
     description: |
-      Cleaned and standardized flight price data.
+      Cleaned and standardized flight price data (INCREMENTAL).
+      
+      **Materialization:** Incremental with merge strategy
+      **Unique Key:** booking_hash
       
       **Transformations:**
       - Trimmed and standardized text fields
@@ -69,11 +78,13 @@ models:
       - Added duration_bucket (Short/Medium/Long)
       - Added booking_lead_bucket (Last Minute/Standard/Early Bird)
     columns:
-      - name: id
-        description: "Primary key from source"
+      - name: booking_hash
+        description: "Unique booking identifier (composite hash)"
         tests:
           - unique
           - not_null
+      - name: id
+        description: "Primary key from source"
       - name: airline
         description: "Airline name (cleaned)"
         tests:
@@ -125,6 +136,8 @@ models:
           - not_null
           - accepted_values:
               values: ['Last Minute (0-3 days)', 'Short Notice (4-14 days)', 'Standard (15-30 days)', 'Early Bird (30+ days)']
+      - name: updated_at
+        description: "Last update timestamp from Bronze"
 
 # ============================================
 # Models: Gold Layer (KPIs)
