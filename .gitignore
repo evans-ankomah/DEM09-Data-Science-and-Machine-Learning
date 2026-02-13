@@ -1,21 +1,41 @@
-# Airflow runtime
-logs/
-airflow.db
-airflow.cfg
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
 
-# dbt build artifacts
-dbt_project/target/
-dbt_project/logs/
-dbt_project/dbt_packages/
+# Virtual environments
+venv/
+.env
 
-# VS Code
+# IDE
 .vscode/
+.idea/
 
-# Output artifacts (optional)
-output/
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+
+# Old directories (pre-restructure)
+dbt_project/target/
+dbt_project/dbt_packages/
+dbt_project/logs/
+
+# Airflow
+logs/
+airflow-webserver.pid
+
+# ML artifacts (tracked via pipeline, not source control)
+models/*.pkl
+output/figures/*.png
+output/metrics/*.csv
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Docker
+*.log

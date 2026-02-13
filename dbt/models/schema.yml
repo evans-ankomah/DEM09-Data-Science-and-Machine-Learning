@@ -226,3 +226,23 @@ models:
         description: "Average fare for this route"
       - name: avg_fare_per_hour
         description: "Average fare per hour of flight"
+
+  - name: ml_features
+    description: |
+      ML-ready feature table for flight fare prediction.
+      Excludes base_fare_bdt and tax_surcharge_bdt to prevent data leakage.
+    columns:
+      - name: airline
+        description: "Airline name"
+        tests:
+          - not_null
+      - name: total_fare_bdt
+        description: "Target variable - Total fare in BDT"
+        tests:
+          - not_null
+      - name: duration_hrs
+        description: "Flight duration in hours"
+      - name: departure_month
+        description: "Month extracted from departure datetime"
+      - name: departure_weekday
+        description: "Day of week extracted from departure datetime"

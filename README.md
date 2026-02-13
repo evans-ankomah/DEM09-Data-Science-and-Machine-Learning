@@ -1,256 +1,131 @@
-# Flight Price Analysis Pipeline
+# Flight Fare Prediction - End-to-End ELT + ML Pipeline
 
-## Overview
-
-An end-to-end data engineering pipeline using **Apache Airflow** and **dbt** with **Medallion Architecture** (Bronze → Silver → Gold) for analyzing Bangladesh flight price data.
-
-### Key Features
-
-- **Optimized Performance**: Bulk inserts with 10,000 row chunks
-- **Incremental Load**: Upsert support for handling updates
-- **Multi-CSV Support**: Process all CSVs in a folder
-- **Deduplication**: Composite hash key for unique bookings
-- **Incremental dbt**: Only processes changed data
-
-```mermaid
-flowchart LR
-    CSV[CSV Files] -->|Bulk Insert| MySQL[(MySQL<br/>Bronze)]
-    MySQL -->|Upsert| PG_Bronze[(PostgreSQL<br/>Bronze)]
-    PG_Bronze -->|Incremental| Silver[(PostgreSQL<br/>Silver)]
-    Silver --> Gold[(PostgreSQL<br/>Gold)]
-    
-    subgraph dbt["dbt Transformations"]
-        Silver
-        Gold
-    end
-```
+An industry-ready pipeline for predicting Bangladesh domestic flight fares using **Airflow + PostgreSQL + dbt + scikit-learn**, fully **Dockerized** with a **Streamlit** deployment.
 
 ## Architecture
 
-| Layer | Database | Description |
-|-------|----------|-------------|
-| **Bronze** | MySQL → PostgreSQL | Raw data ingestion with upsert support |
-| **Silver** | PostgreSQL | Cleaned data with incremental materialization |
-| **Gold** | PostgreSQL | KPI and analytics tables |
-
----
-
-## Optimization Features (v2)
-
-### 1. Incremental Load with Upsert
-
-The pipeline now supports incremental loads using a **composite hash key**:
-
 ```
-booking_hash = hash(airline + source + destination + departure_datetime + class + booking_source)
+CSV Data --> Airflow DAG --> PostgreSQL Bronze --> dbt Silver --> dbt Gold
+                                                                    |
+                                                            gold.ml_features
+                                                                    |
+                                                        ML Training (6 models)
+                                                                    |
+                                                        best_model.pkl --> Streamlit App
 ```
 
-| Database | Strategy |
-|----------|----------|
-| MySQL | `INSERT ON DUPLICATE KEY UPDATE` |
-| PostgreSQL | `INSERT ... ON CONFLICT DO UPDATE` |
-
-### 2. Multi-CSV File Support
-
-```python
-CSV_FOLDER = '/opt/airflow/data/'
-CSV_PATTERN = 'Flight_Price_*.csv'  # Processes all matching files
-```
-
-### 3. dbt Incremental Materialization
-
-Silver layer only processes new/updated rows:
-```sql
-{{ config(materialized='incremental', unique_key='booking_hash') }}
-```
-
----
-
-## RUN GUIDE
-
-### Prerequisites
-
-- Docker & Docker Compose installed
-- At least 4GB RAM available for containers
-
-### Step 1: Clone/Navigate to Project
-
-```bash
-cd flight-price-airflow-dbt
-```
-
-### Step 2: Add Your CSV Dataset
-
-Place CSV files in the data folder:
-
-```bash
-mkdir -p include/data
-cp /path/to/Flight_Price_*.csv include/data/
-```
-
-### Step 3: Start All Services
-
-```bash
-docker-compose up -d
-```
-
-Wait 2-3 minutes for services to initialize (dbt is installed on startup).
-
-```bash
-docker-compose ps
-```
-
-### Step 4: Access Airflow UI
-
-1. Open http://localhost:8080
-2. Login with:
-   - **Username**: `airflow`
-   - **Password**: `airflow`
-
-### Step 5: Trigger the DAG
-
-1. Find `flight_price_pipeline` in the DAG list
-2. Click the ▶️ (Play) button to trigger a run
-3. Monitor progress in the Graph view
-
----
-
-## Pipeline Tasks
-
-| Task | Description |
-|------|-------------|
-| `start` | Pipeline entry point |
-| `load_csv_to_mysql` | Load CSVs with bulk insert + upsert |
-| `validate_mysql_data` | Validate data quality + duplicate check |
-| `transfer_to_postgres_bronze` | Transfer with upsert support |
-| `run_dbt_transformations` | Build Silver + Gold layers (incremental) |
-| `end` | Pipeline completion |
-
----
-
-## TEST GUIDE
-
-### Verify Bronze Layer (MySQL)
-
-```bash
-docker exec mysql mysql -u root -proot flight_bronze -e "SELECT COUNT(*) AS row_count FROM raw_flight_prices;"
-```
-
-**Expected**: ~57,000 rows
-
-### Verify PostgreSQL Layers
-
-```bash
-docker exec postgres psql -U postgres -d analytics -c "
-SELECT 'bronze.raw_flight_prices' AS table_name, COUNT(*) FROM bronze.raw_flight_prices
-UNION ALL SELECT 'public_silver.stg_flight_prices', COUNT(*) FROM public_silver.stg_flight_prices
-UNION ALL SELECT 'public_gold.avg_fare_by_airline', COUNT(*) FROM public_gold.avg_fare_by_airline;"
-```
-
-### Verify booking_hash Column
-
-```bash
-docker exec postgres psql -U postgres -d analytics -c "SELECT booking_hash, airline, source, destination FROM bronze.raw_flight_prices LIMIT 3;"
-```
-
-### Verify Incremental Processing
-
-Check dbt logs for incremental messages:
-```
-Completed successfully.
-Done. PASS=7 ERROR=0
-```
-
----
-
-## Silver Layer Transformations
-
-| Transformation | Description |
-|----------------|-------------|
-| `booking_hash` | Unique composite key for deduplication |
-| `duration_bucket` | Short (0-3h), Medium (3-6h), Long (6+h) |
-| `booking_lead_bucket` | Last Minute, Short Notice, Standard, Early Bird |
-| Data cleaning | Trims whitespace, parses dates, ensures non-negative fares |
-
----
-
-## Gold Layer KPIs
-
-| Model | Description |
-|-------|-------------|
-| `avg_fare_by_airline` | Average fare per airline |
-| `avg_fare_by_class` | Average fare by travel class |
-| `avg_fare_by_route` | Average fare per route with price-per-hour metric |
-| `booking_count_by_airline` | Total bookings and market share |
-| `top_routes` | Most popular routes |
-| `seasonal_fare_variation` | Fare patterns by seasonality |
-
----
-
-## TROUBLESHOOTING GUIDE
-
-### dbt Command Not Found
-
-**Symptom**: `dbt: command not found`
-
-**Note**: dbt is now automatically installed in the scheduler container on startup. If issue persists:
-```bash
-docker exec airflow-scheduler pip install dbt-postgres==1.7.0
-```
-
-### Database Connection Refused
-
-1. Check containers are running: `docker-compose ps`
-2. Wait 30-60 seconds for databases to initialize
-3. Restart containers: `docker-compose restart`
-
-### Incremental Merge Error
-
-If you see `syntax error at or near "merge"`, ensure the dbt model uses `delete+insert` strategy (not `merge`) for PostgreSQL 13 compatibility.
-
-### How to View Logs
-
-**Airflow task logs**:
-```bash
-docker-compose logs airflow-scheduler --tail 100
-```
-
-**dbt logs**:
-```bash
-docker exec airflow-scheduler cat /opt/airflow/dbt_project/logs/dbt.log
-```
-
----
+**Medallion Architecture:**
+- **Bronze**: Raw CSV data loaded into `bronze.raw_flight_prices` with deduplication via booking hash
+- **Silver**: Cleaned & standardized in `silver.stg_flight_prices` (incremental)
+- **Gold**: KPI tables + `gold.ml_features` (ML feature-ready, leakage-free)
 
 ## Project Structure
 
 ```
 flight-price-airflow-dbt/
-├── dags/
-│   └── flight_price_pipeline.py    # Main DAG with optimizations
-├── dbt_project/
-│   ├── models/
-│   │   ├── silver/
-│   │   │   └── stg_flight_prices.sql    # Incremental model
-│   │   ├── gold/                         # 6 KPI tables
-│   │   └── schema.yml                    # Tests & docs
-│   ├── profiles.yml
-│   └── packages.yml
-├── include/data/                         # CSV files folder
-├── docker-compose.yml                    # With dbt auto-install
-└── README.md
+├── airflow/dags/                    # Airflow DAG (pipeline orchestration)
+│   └── flight_price_pipeline.py
+├── dbt/                             # dbt project (Silver + Gold layers)
+│   ├── models/silver/               # Cleaned data
+│   ├── models/gold/                 # KPIs + ML features
+│   ├── dbt_project.yml
+│   └── profiles.yml
+├── ml/                              # Machine Learning
+│   ├── src/                         # Reusable Python modules
+│   │   ├── data_loader.py           # Load from Postgres or CSV
+│   │   ├── preprocessing.py         # Feature engineering + encoding
+│   │   ├── train.py                 # Train 6 models with tuning
+│   │   ├── evaluate.py              # R2, MAE, RMSE metrics
+│   │   └── visualize.py             # 10+ reusable plot functions
+│   └── notebooks/
+│       └── eda.ipynb                # Exploratory Data Analysis
+├── streamlit/
+│   └── app.py                       # Live prediction web app
+├── docker/
+│   ├── Dockerfile                   # Custom Airflow image + ML deps
+│   └── docker-compose.yml           # Full stack orchestration
+├── data/                            # Raw CSV dataset
+├── output/                          # Auto-generated outputs
+│   ├── figures/                     # EDA + model plots
+│   └── metrics/                     # Model comparison CSV
+├── models/                          # Saved ML model artifacts
+├── requirements.txt
+├── README.md
+└── USER_GUIDE.md
 ```
 
----
+## Tech Stack
 
-## Stopping the Pipeline
+| Component | Technology |
+|-----------|------------|
+| Orchestration | Apache Airflow 2.7 |
+| Database | PostgreSQL 13 |
+| Transformations | dbt-postgres 1.7 |
+| ML Framework | scikit-learn 1.3 |
+| Visualization | matplotlib, seaborn |
+| Deployment | Streamlit |
+| Containerization | Docker Compose |
+
+## Quick Start
+
+### Prerequisites
+- Docker & Docker Compose installed
+- ~4GB free disk space
+
+### Run
 
 ```bash
-docker-compose down
+# Clone and navigate to project
+cd flight-price-airflow-dbt
+
+# Start all services
+docker compose -f docker/docker-compose.yml up --build
+
+# Wait for initialization (~2 min), then access:
+# Airflow UI: http://localhost:8080 (user: airflow, pass: airflow)
+# Streamlit:  http://localhost:8501
 ```
 
-To remove all data (for fresh start):
+### Trigger the Pipeline
 
-```bash
-docker-compose down -v
-```
+1. Open Airflow at `http://localhost:8080`
+2. Find DAG `flight_price_pipeline`
+3. Click "Trigger DAG" (play button)
+4. Monitor task progress: `start → load → validate → dbt → data_gate → ml_training → end`
+
+### View Results
+
+- **Metrics**: `output/metrics/metrics.csv`
+- **Plots**: `output/figures/`
+- **Model**: `models/best_model.pkl`
+- **Live predictions**: `http://localhost:8501`
+
+## ML Models
+
+| Model | Description |
+|-------|-------------|
+| Linear Regression | Baseline model |
+| Ridge | L2 regularization |
+| Lasso | L1 regularization |
+| Decision Tree | Non-linear tree-based |
+| Random Forest | Ensemble of trees |
+| Gradient Boosting | Sequential boosting |
+
+All models are tuned with `RandomizedSearchCV` and compared via cross-validation.
+
+**Features used**: airline, source, destination, class, stopovers, booking source, seasonality, duration, days before departure, departure month/weekday/hour, duration bucket, booking lead bucket.
+
+**Excluded** (leakage prevention): `base_fare_bdt`, `tax_surcharge_bdt` (since total = base + tax).
+
+## Airflow DAG Features
+
+- **Retries**: 3 retries with exponential backoff (2min → 30min max)
+- **Data gate**: Checks `gold.ml_features` for rows before ML training; skips gracefully if empty
+- **Slack alerts**: DAG-level `on_failure_callback` sends failure details (DAG, task, run_id, log URL)
+- **Execution timeout**: 2 hours per task
+
+## Dataset
+
+**Flight Price Dataset of Bangladesh** (Kaggle)
+- ~100K+ flight records
+- Features: airline, source, destination, class, fare, duration, season, etc.
