@@ -26,6 +26,12 @@ clean-targets:
 # Model configurations
 models:
   flight_price_dbt:
+    # Bronze layer: Documented view over raw data
+    bronze:
+      +materialized: view
+      +schema: bronze
+      +tags: ['bronze', 'raw']
+
     # Silver layer: Cleaned and standardized data
     silver:
       +materialized: table

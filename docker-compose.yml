@@ -7,7 +7,7 @@ version: '3.8'
 
 x-airflow-common: &airflow-common
   build:
-    context: ..
+    context: .
     dockerfile: docker/Dockerfile
   environment:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -26,13 +26,13 @@ x-airflow-common: &airflow-common
     # dbt config
     DBT_PROFILES_DIR: /opt/airflow/dbt
   volumes:
-    - ../airflow/dags:/opt/airflow/dags
-    - ../dbt:/opt/airflow/dbt
-    - ../ml:/opt/airflow/ml
-    - ../data:/opt/airflow/data
-    - ../output:/opt/airflow/output
-    - ../models:/opt/airflow/models
-    - ../logs:/opt/airflow/logs
+    - ./airflow/dags:/opt/airflow/dags
+    - ./dbt:/opt/airflow/dbt
+    - ./ml:/opt/airflow/ml
+    - ./data:/opt/airflow/data
+    - ./output:/opt/airflow/output
+    - ./models:/opt/airflow/models
+    - ./logs:/opt/airflow/logs
   depends_on:
     postgres:
       condition: service_healthy
@@ -154,10 +154,10 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      - ../streamlit:/opt/airflow/streamlit
-      - ../models:/opt/airflow/models
-      - ../output:/opt/airflow/output
-      - ../ml:/opt/airflow/ml
+      - ./streamlit:/opt/airflow/streamlit
+      - ./models:/opt/airflow/models
+      - ./output:/opt/airflow/output
+      - ./ml:/opt/airflow/ml
     depends_on:
       postgres:
         condition: service_healthy

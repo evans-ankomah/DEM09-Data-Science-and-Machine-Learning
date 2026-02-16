@@ -61,9 +61,38 @@ sources:
             description: "Record last update timestamp (for incremental loads)"
 
 # ============================================
-# Models: Silver Layer (Incremental)
+# Models: Bronze Layer (View)
 # ============================================
 models:
+  - name: bronze_flight_prices
+    description: |
+      Documented pass-through view over bronze.raw_flight_prices.
+      Provides Bronze → Silver → Gold lineage within dbt.
+      Data is loaded by the Airflow DAG (CSV → Postgres).
+    columns:
+      - name: booking_hash
+        description: "Unique booking identifier (composite hash)"
+        tests:
+          - unique
+          - not_null
+      - name: airline
+        description: "Airline name"
+        tests:
+          - not_null
+      - name: source
+        description: "Source airport code"
+        tests:
+          - not_null
+      - name: destination
+        description: "Destination airport code"
+        tests:
+          - not_null
+      - name: total_fare_bdt
+        description: "Total fare in BDT"
+
+# ============================================
+# Models: Silver Layer (Incremental)
+# ============================================
   - name: stg_flight_prices
     description: |
       Cleaned and standardized flight price data (INCREMENTAL).

@@ -54,7 +54,7 @@ WITH source_data AS (
         days_before_departure,
         created_at,
         updated_at
-    FROM {{ source('bronze', 'raw_flight_prices') }}
+    FROM {{ ref('bronze_flight_prices') }}
     
     {% if is_incremental() %}
         -- Only get new or updated rows since last run

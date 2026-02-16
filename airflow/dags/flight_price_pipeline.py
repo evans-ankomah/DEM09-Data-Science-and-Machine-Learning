@@ -1,24 +1,24 @@
 """
-Flight Price Analysis Pipeline - Airflow DAG (v4)
+Flight Price Analysis Pipeline - Airflow DAG (v5)
 ==================================================
 
 End-to-end ELT + ML pipeline for Bangladesh flight price analysis.
 Medallion Architecture (Bronze -> Silver -> Gold) with Postgres + dbt.
 
 Pipeline Flow:
-  start -> check_csv_exists -> load_csv_to_postgres -> validate_bronze
-       -> run_dbt -> validate_silver -> validate_gold
-       -> train_ml_model -> end
+  start -> check_csv -> [BRANCH]
+                          |-> (CSV found)    -> load_csv -> validate_bronze
+                          |                       -> dbt -> validate_silver -> validate_gold
+                          |                       -> train_ml -> end
+                          |-> (CSV missing)  -> alert_no_csv -> end
 
 Data Quality Gates:
-  - CSV existence check at pipeline start (fail-fast)
-  - Bronze layer row count + quality validation
-  - Silver layer validation (post-dbt)
-  - Gold layer validation (ml_features ready)
-  - All failures trigger Slack + email alerts via on_failure_callback
+  - CSV existence: BranchPythonOperator (branch + alert if missing)
+  - Bronze/Silver/Gold: Retries + on_failure_callback (Slack + email)
 
 Features:
-  - Retries with exponential backoff at every task
+  - BranchPythonOperator for CSV check with immediate alerting
+  - Retries with exponential backoff at every processing stage
   - DAG-level and task-level on_failure_callback (Slack + email)
   - Structured logging throughout
 """
@@ -34,7 +34,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.operators.bash import BashOperator
 from airflow.operators.empty import EmptyOperator
 
@@ -85,15 +85,8 @@ def _build_alert_message(context, alert_type='failure'):
     )
 
 
-def slack_failure_callback(context):
-    """
-    Send Slack alert on any task failure.
-    Uses the 'slack_webhook' Airflow Connection.
-    Includes DAG name, task name, run_id, and Airflow log URL.
-    """
-    message = _build_alert_message(context, 'failure')
-    logger.error(f"ALERT: {message}")
-
+def _send_slack_alert(message):
+    """Send a Slack alert via webhook (non-blocking)."""
     try:
         from airflow.providers.http.hooks.http import HttpHook
         hook = HttpHook(http_conn_id='slack_webhook', method='POST')
@@ -102,23 +95,38 @@ def slack_failure_callback(context):
             data=json.dumps({"text": message}),
             headers={'Content-Type': 'application/json'}
         )
-        logger.info("Slack failure alert sent")
+        logger.info("Slack alert sent")
     except Exception as e:
         logger.warning(f"Slack alert failed (non-blocking): {e}")
 
-    # Email alert (uses Airflow's SMTP if configured)
+
+def _send_email_alert(subject, message):
+    """Send an email alert (non-blocking)."""
     try:
         from airflow.utils.email import send_email
-        ti = context.get('task_instance')
-        subject = f"[AIRFLOW ALERT] {ti.dag_id}.{ti.task_id} FAILED"
         send_email(
             to='admin@example.com',
             subject=subject,
             html_content=message.replace('\n', '<br>')
         )
-        logger.info("Email failure alert sent")
+        logger.info("Email alert sent")
     except Exception as e:
         logger.warning(f"Email alert failed (non-blocking): {e}")
+
+
+def slack_failure_callback(context):
+    """
+    on_failure_callback: Send Slack + email alert on any task failure.
+    Attached to every task via default_args.
+    """
+    message = _build_alert_message(context, 'failure')
+    logger.error(f"ALERT: {message}")
+
+    _send_slack_alert(message)
+
+    ti = context.get('task_instance')
+    subject = f"[AIRFLOW ALERT] {ti.dag_id}.{ti.task_id} FAILED"
+    _send_email_alert(subject, message)
 
 
 # ============================================
@@ -181,41 +189,74 @@ def _check_table_rows(schema, table):
 
 
 # ============================================
-# GATE 1: Check CSV Exists
+# BRANCH: Check CSV Exists (BranchPythonOperator)
 # ============================================
 
 def check_csv_exists(**context):
     """
-    DATA GATE: Verify CSV data files exist before starting the pipeline.
-    Raises FileNotFoundError if no CSV files are found (triggers retry + alert).
+    BranchPythonOperator callable:
+      - Returns 'load_csv_to_postgres' if CSV files are found
+      - Returns 'alert_no_csv' if no CSV files exist (triggers alert branch)
     """
-    logger.info(f"GATE 1: Checking for CSV files in {CSV_FOLDER}")
+    logger.info(f"BRANCH: Checking for CSV files in {CSV_FOLDER}")
 
     csv_files = glob.glob(os.path.join(CSV_FOLDER, CSV_PATTERN))
     if not csv_files:
         csv_files = glob.glob(os.path.join(CSV_FOLDER, '*.csv'))
 
     if not csv_files:
-        raise FileNotFoundError(
-            f"DATA GATE FAILED: No CSV files found in {CSV_FOLDER}. "
-            f"Expected pattern: {CSV_PATTERN}. "
-            f"Pipeline cannot proceed without source data."
+        logger.error(
+            f"NO CSV FILES FOUND in {CSV_FOLDER}. "
+            f"Branching to alert_no_csv task."
         )
+        return 'alert_no_csv'
 
     # Validate files are not empty
-    total_size = 0
+    valid_files = []
     for f in csv_files:
         size = os.path.getsize(f)
         if size == 0:
-            raise ValueError(f"DATA GATE FAILED: CSV file is empty: {f}")
-        total_size += size
+            logger.warning(f"  Skipping empty file: {f}")
+            continue
+        valid_files.append(f)
         logger.info(f"  Found: {f} ({size / 1024 / 1024:.1f} MB)")
 
-    logger.info(f"GATE 1 PASSED: {len(csv_files)} CSV file(s), "
-                 f"total {total_size / 1024 / 1024:.1f} MB")
+    if not valid_files:
+        logger.error("All CSV files are empty. Branching to alert_no_csv.")
+        return 'alert_no_csv'
 
-    context['ti'].xcom_push(key='csv_files', value=csv_files)
-    return {'files': len(csv_files), 'total_size_mb': round(total_size / 1024 / 1024, 1)}
+    logger.info(f"CSV CHECK PASSED: {len(valid_files)} valid file(s)")
+    context['ti'].xcom_push(key='csv_files', value=valid_files)
+    return 'load_csv_to_postgres'
+
+
+# ============================================
+# Alert Task: No CSV Found (Slack + Email)
+# ============================================
+
+def alert_no_csv(**context):
+    """
+    Alert task triggered when BranchPythonOperator detects no CSV files.
+    Sends immediate Slack + email notification and logs the issue.
+    """
+    message = (
+        ":file_folder: *DATA SOURCE MISSING*\n"
+        f"*DAG:* `flight_price_pipeline`\n"
+        f"*Issue:* No CSV files found in `{CSV_FOLDER}`\n"
+        f"*Expected Pattern:* `{CSV_PATTERN}`\n"
+        f"*Action Required:* Upload CSV data to the data/ directory "
+        f"and re-trigger the DAG.\n"
+        f"*Run ID:* `{context.get('run_id', 'unknown')}`\n"
+        f"*Timestamp:* `{datetime.now().isoformat()}`"
+    )
+
+    logger.error(f"ALERT - NO CSV: {message}")
+    _send_slack_alert(message)
+    _send_email_alert(
+        "[AIRFLOW ALERT] flight_price_pipeline - NO CSV DATA",
+        message
+    )
+    logger.info("Alert sent. Pipeline will skip to end.")
 
 
 # ============================================
@@ -510,8 +551,8 @@ with DAG(
     dag_id='flight_price_pipeline',
     default_args=default_args,
     description=(
-        'End-to-end ELT + ML pipeline with data quality gates at every layer '
-        '(CSV → Bronze → Silver → Gold → ML)'
+        'End-to-end ELT + ML pipeline with BranchPythonOperator for CSV check '
+        'and data quality gates at every layer (CSV → Bronze → Silver → Gold → ML)'
     ),
     schedule_interval=None,
     start_date=datetime(2024, 1, 1),
@@ -523,15 +564,23 @@ with DAG(
     # ---- Start ----
     task_start = EmptyOperator(task_id='start')
 
-    # ---- GATE 1: CSV Check ----
-    task_check_csv = PythonOperator(
+    # ---- BRANCH: CSV Check ----
+    task_check_csv = BranchPythonOperator(
         task_id='check_csv_exists',
         python_callable=check_csv_exists,
         doc_md="""
-        ## Gate 1: CSV Data Check
-        Verifies source CSV files exist and are non-empty.
-        **Failure**: Retries 3x, then sends Slack + email alert.
+        ## Branch: CSV Data Check
+        Uses BranchPythonOperator to check for CSV files.
+        - **CSV found** → continues to `load_csv_to_postgres`
+        - **CSV missing** → branches to `alert_no_csv` → `end`
         """,
+    )
+
+    # ---- Alert: No CSV (branch target) ----
+    task_alert_no_csv = PythonOperator(
+        task_id='alert_no_csv',
+        python_callable=alert_no_csv,
+        doc_md="Sends Slack + email alert when no CSV files are found.",
     )
 
     # ---- Load to Bronze ----
@@ -548,24 +597,24 @@ with DAG(
         doc_md="""
         ## Gate 2: Bronze Layer Validation
         Checks row count, nulls, negative fares, and duplicates.
-        **Failure**: Retries 3x, then sends Slack + email alert.
+        **Failure**: Retries 2x, then sends Slack + email alert.
         """,
     )
 
-    # ---- dbt Transformations (Silver + Gold) ----
+    # ---- dbt Transformations (Bronze view + Silver + Gold) ----
     task_dbt = BashOperator(
         task_id='run_dbt_transformations',
         bash_command='''
             cd /opt/airflow/dbt && \
             echo "Installing dbt dependencies..." && \
             dbt deps --profiles-dir . && \
-            echo "Running dbt models (Silver + Gold)..." && \
+            echo "Running dbt models (Bronze + Silver + Gold)..." && \
             dbt run --profiles-dir . && \
             echo "Running dbt tests..." && \
             dbt test --profiles-dir . && \
             echo "dbt transformations complete!"
         ''',
-        doc_md="Run dbt Silver (cleaning) and Gold (KPIs + ML features) transformations.",
+        doc_md="Run dbt Bronze (view), Silver (cleaning), and Gold (KPIs + ML features) transformations.",
     )
 
     # ---- GATE 3: Silver Validation ----
@@ -575,7 +624,7 @@ with DAG(
         doc_md="""
         ## Gate 3: Silver Layer Validation
         Checks dbt Silver output has rows. Reports Bronze→Silver data loss.
-        **Failure**: Retries 3x, then sends Slack + email alert.
+        **Failure**: Retries 2x, then sends Slack + email alert.
         """,
     )
 
@@ -586,7 +635,7 @@ with DAG(
         doc_md="""
         ## Gate 4: Gold Layer Validation
         Checks ml_features and all KPI tables have data.
-        **Failure**: Retries 3x, then sends Slack + email alert.
+        **Failure**: Retries 2x, then sends Slack + email alert.
         """,
     )
 
@@ -598,20 +647,22 @@ with DAG(
         doc_md="Train 6 ML models, tune hyperparameters, save best model + metrics.",
     )
 
-    # ---- End ----
-    task_end = EmptyOperator(task_id='end')
+    # ---- End (with trigger_rule for branch convergence) ----
+    task_end = EmptyOperator(
+        task_id='end',
+        trigger_rule='none_failed_min_one_success',
+    )
 
     # ---- Pipeline Flow ----
-    # Linear chain with gates at every layer:
-    # start → csv_check → load → bronze_gate → dbt → silver_gate → gold_gate → ml → end
-    (
-        task_start
-        >> task_check_csv
-        >> task_load
-        >> task_validate_bronze
-        >> task_dbt
-        >> task_validate_silver
-        >> task_validate_gold
-        >> task_ml
-        >> task_end
-    )
+    # Branch pattern:
+    #   start → check_csv → [BRANCH]
+    #                          ├→ load_csv → bronze_gate → dbt → silver_gate → gold_gate → ml → end
+    #                          └→ alert_no_csv → end
+    task_start >> task_check_csv
+
+    # Branch 1: CSV found → full pipeline
+    task_check_csv >> task_load >> task_validate_bronze >> task_dbt
+    task_dbt >> task_validate_silver >> task_validate_gold >> task_ml >> task_end
+
+    # Branch 2: CSV missing → alert then end
+    task_check_csv >> task_alert_no_csv >> task_end
